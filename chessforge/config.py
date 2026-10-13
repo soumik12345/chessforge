@@ -14,6 +14,7 @@ class ModelConfig:
     name: str = "maia3-5m"
     arch: str = "chessformer"
     history: int = 8               # boards incl. current (paper's n = history - 1)
+    include_time_info: bool = False
     dim_emb: int = 128             # Elo soft-embedding dim
     dim_vit: int = 256
     num_blocks: int = 8

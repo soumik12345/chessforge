@@ -28,7 +28,6 @@ def list_files(pattern: str) -> list[str]:
 
 
 def stage_files(files: list[str], cache_dir: str) -> list[str]:
-    """Copy gs:// shards to local disk (ArrayRecord needs local or gcsfuse paths)."""
     if not cache_dir:
         return files
     os.makedirs(cache_dir, exist_ok=True)
@@ -44,6 +43,23 @@ def stage_files(files: list[str], cache_dir: str) -> list[str]:
                 shutil.copyfileobj(src, dst, length=16 << 20)
             os.replace(tmp, local)
         out.append(local)
+    return out
+
+
+def empty_batch(batch_size: int, history: int, with_legal: bool = True) -> dict[str, np.ndarray]:
+    out = {
+        "board": np.zeros((batch_size, history, 64), np.int8),
+        "time_info": np.zeros((batch_size, 3), np.float32),
+        "self_elo": np.zeros((batch_size,), np.float32),
+        "oppo_elo": np.zeros((batch_size,), np.float32),
+        "game_elo": np.zeros((batch_size,), np.float32),
+        "move": np.zeros((batch_size,), np.int32),
+        "value": np.zeros((batch_size,), np.int32),
+        "ponder": np.zeros((batch_size,), np.float32),
+        "weight": np.zeros((batch_size,), np.float32),
+    }
+    if with_legal:
+        out["legal"] = np.ones((batch_size, cu.VOCAB_SIZE), np.bool_)
     return out
 
 
@@ -66,8 +82,11 @@ class FeaturizeTransform(pygrain.RandomMapTransform):
             n_hist = int(rng.integers(0, n_hist + 1))
         rel = cu.to_relative_codes(boards, int(rec["stm"]), n_hist)
         self_elo, oppo_elo = float(rec["self_elo"]), float(rec["oppo_elo"])
+        time_info = np.array([rec["base_time"] / 100.0, rec["increment"] / 100.0, rec["clk_left"] / 100.0],
+                             dtype=np.float32)
         out = {
             "board": rel.astype(np.int8),
+            "time_info": time_info,
             "self_elo": np.float32(self_elo),
             "oppo_elo": np.float32(oppo_elo),
             "game_elo": np.float32((self_elo + oppo_elo) / 2),
@@ -108,7 +127,7 @@ def make_train_iterator(data_cfg, history: int, *, pattern: str | None = None, s
     per_host = data_cfg.global_batch_size // pcount
     ds = _host_dataset(pattern or data_cfg.train_glob, data_cfg.local_cache_dir)
     n_local = len(ds)
-    ds = ds.shuffle(seed=seed + 7919 * pidx).repeat()  # shuffle before repeat => reshuffled per epoch
+    ds = ds.shuffle(seed=seed + 7919 * pidx).repeat()
     ds = ds.random_map(FeaturizeTransform(history, data_cfg.history_mask_prob, with_legal=True),
                        seed=seed + 104729 * (pidx + 1))
     it_ds = ds.to_iter_dataset(pygrain.ReadOptions(num_threads=data_cfg.read_threads,
@@ -125,7 +144,8 @@ def _pad(batch: dict, size: int) -> dict:
         return batch
     out = {}
     for k, v in batch.items():
-        pad = np.zeros((size - n,) + v.shape[1:], v.dtype)
+        pad_val = True if k == "legal" else 0
+        pad = np.full((size - n,) + v.shape[1:], pad_val, dtype=v.dtype)
         out[k] = np.concatenate([v, pad], 0)
     return out
 
@@ -138,14 +158,13 @@ def eval_batches(pattern: str, history: int, global_batch_size: int, cache_dir: 
     ds = _host_dataset(pattern, cache_dir)
     n_local = len(ds)
     ds = ds.random_map(FeaturizeTransform(history, 0.0, with_legal=True), seed=0)
-    template = ds[0]
-    n_batches = math.ceil(n_local / per_host)
+    n_batches = math.ceil(n_local / per_host) if n_local > 0 else 0
     n_batches = int(np.max(multihost_utils.process_allgather(np.array(n_batches))))
     if max_batches:
         n_batches = min(n_batches, max_batches)
     it = iter(ds.to_iter_dataset(pygrain.ReadOptions(num_threads=read_threads, prefetch_buffer_size=64))
-              .batch(per_host, drop_remainder=False))
-    empty = {k: np.zeros((per_host,) + np.shape(v), np.asarray(v).dtype) for k, v in template.items()}
+              .batch(per_host, drop_remainder=False)) if n_local > 0 else iter(())
+    empty = empty_batch(per_host, history, with_legal=True)
     for _ in range(n_batches):
         b = next(it, None)
         yield empty if b is None else _pad(b, per_host)

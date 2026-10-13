@@ -17,10 +17,35 @@ from .. import chess_utils as cu
 from . import records
 
 HEADER_RE = re.compile(r'^\[(\w+)\s+"(.*)"\]\s*$')
-MOVE_RE = re.compile(r"([^\s{}]+)\s*\{([^}]*)\}")
+MOVE_RE = re.compile(r"([^\s{}()]+)\s*\{([^}]*)\}")
 CLK_RE = re.compile(r"\[%clk\s+(\d+):(\d+):(\d+(?:\.\d+)?)\]")
+NAG_RE = re.compile(r"\$\d+")
 RESULTS = ("1-0", "0-1", "1/2-1/2")
 NUM_ELO_BINS = 22  # <600, [600,700), ..., [2500,2600), >=2600
+
+
+def strip_variations(movetext: str) -> str:
+    """Remove parenthesized sidelines (...) outside {...} comments so MOVE_RE
+    never matches annotated sideline moves in analyzed Lichess games."""
+    if "(" not in movetext:
+        return NAG_RE.sub("", movetext)
+    out = []
+    in_brace = False
+    paren_depth = 0
+    for ch in movetext:
+        if ch == "{" and paren_depth == 0:
+            in_brace = True
+            out.append(ch)
+        elif ch == "}" and in_brace:
+            in_brace = False
+            out.append(ch)
+        elif not in_brace and ch == "(":
+            paren_depth += 1
+        elif not in_brace and ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif paren_depth == 0:
+            out.append(ch)
+    return NAG_RE.sub("", "".join(out))
 
 
 def open_pgn_stream(path: str, compressed: bool | None = None) -> io.TextIOBase:
@@ -77,13 +102,14 @@ class GameFilter:
         if h.get("Variant", "Standard") != "Standard" or "FEN" in h:
             return False
         try:
-            int(h["WhiteElo"]); int(h["BlackElo"])
+            int(h["WhiteElo"])
+            int(h["BlackElo"])
+            base, inc = h.get("TimeControl", "-").split("+")
+            int(base)
+            int(inc)
         except (KeyError, ValueError):
             return False
         if self.exclude_bots and "BOT" in (h.get("WhiteTitle", "").upper(), h.get("BlackTitle", "").upper()):
-            return False
-        tc = h.get("TimeControl", "-")
-        if "+" not in tc:
             return False
         if self.require_clock and "[%clk" not in movetext:
             return False
@@ -131,6 +157,7 @@ class PositionConfig:
     positions_per_game: int = 32   # 0 => keep every eligible position
     skip_first_plies: int = 0      # Maia-3 training keeps the opening; ALLIE eval drops 10
     min_clock_seconds: float = 30.0
+    clock_check_on_comment: bool = True  # True: break as soon as [%clk] < min_clock_seconds
     max_ply: int = 100_000
     store_legal: bool = True
     seed: int = 0
@@ -144,7 +171,8 @@ def _clock_seconds(comment: str):
 
 
 def game_to_records(h: dict, movetext: str, cfg: PositionConfig) -> list[bytes]:
-    pairs = MOVE_RE.findall(movetext)
+    cleaned = strip_variations(movetext)
+    pairs = MOVE_RE.findall(cleaned)
     if not pairs:
         return []
     base, inc = (int(x) for x in h["TimeControl"].split("+"))
@@ -153,26 +181,30 @@ def game_to_records(h: dict, movetext: str, cfg: PositionConfig) -> list[bytes]:
 
     board = chess.Board()
     clocks = [float(base), float(base)]
-    codes, move_objs, move_idx, ponders = [], [], [], []
+    codes, move_objs, move_idx, clk_lefts, ponders = [], [], [], [], []
     for ply, (san, comment) in enumerate(pairs):
         if ply >= cfg.max_ply:
             break
-        # truncate at the first time either player has < min_clock seconds
         if min(clocks) < cfg.min_clock_seconds:
             break
+        clk = _clock_seconds(comment)
+        if clk is None:
+            break
+        if cfg.clock_check_on_comment and clk < cfg.min_clock_seconds:
+            break
         try:
-            move = board.parse_san(san.rstrip("?!"))
+            move = board.parse_san(san.rstrip("?!+# "))
         except ValueError:
             break
         stm = ply & 1
-        clk = _clock_seconds(comment)
+        clk_before = clocks[stm]
         codes.append(cu.board_codes(board))
         move_objs.append(move)
         move_idx.append(cu.stm_move_index(move, board.turn))
-        ponders.append(clocks[stm] - clk + inc if clk is not None else np.nan)
+        clk_lefts.append(clk_before)
+        ponders.append(max(0.0, clk_before - clk + (inc if ply >= 2 else 0.0)))
         board.push(move)
-        if clk is not None:
-            clocks[stm] = clk
+        clocks[stm] = clk
 
     n = len(move_idx)
     eligible = np.arange(cfg.skip_first_plies, n)
@@ -204,8 +236,8 @@ def game_to_records(h: dict, movetext: str, cfg: PositionConfig) -> list[bytes]:
             boards=window, n_hist=p - lo, stm=stm, move=move_idx[p],
             self_elo=elos[stm], oppo_elo=elos[1 - stm],
             value=cu.value_label(result, white_to_move=(stm == 0)),
-            ply=p, ponder=ponders[p], base_time=base, increment=inc,
-            legal=legal_at.get(p)))
+            ply=p, clk_left=clk_lefts[p], ponder=ponders[p],
+            base_time=base, increment=inc, legal=legal_at.get(p)))
     return out
 
 

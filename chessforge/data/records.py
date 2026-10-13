@@ -5,7 +5,7 @@ import functools
 
 import numpy as np
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 @functools.lru_cache(maxsize=None)
@@ -19,6 +19,7 @@ def position_dtype(history: int) -> np.dtype:
         ("oppo_elo", np.int16),
         ("value", np.int8),                  # 0 loss, 1 draw, 2 win (side to move)
         ("ply", np.int16),
+        ("clk_left", np.float32),            # seconds on clock before move
         ("ponder", np.float32),              # seconds spent on the move (nan if unknown)
         ("base_time", np.int16),
         ("increment", np.int16),
@@ -27,7 +28,7 @@ def position_dtype(history: int) -> np.dtype:
 
 
 def encode_position(*, boards, n_hist, stm, move, self_elo, oppo_elo, value, ply,
-                    ponder, base_time, increment, legal=None) -> bytes:
+                    clk_left=0.0, ponder=np.nan, base_time=0, increment=0, legal=None) -> bytes:
     H = boards.shape[0]
     rec = np.zeros(1, position_dtype(H))
     rec["boards"][0] = boards
@@ -38,6 +39,7 @@ def encode_position(*, boards, n_hist, stm, move, self_elo, oppo_elo, value, ply
     rec["oppo_elo"] = oppo_elo
     rec["value"] = value
     rec["ply"] = min(ply, 32767)
+    rec["clk_left"] = clk_left
     rec["ponder"] = ponder
     rec["base_time"] = min(base_time, 32767)
     rec["increment"] = min(increment, 32767)

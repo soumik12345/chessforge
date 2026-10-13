@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,10 +11,16 @@ import numpy as np
 NUM_RATING_BINS = 32  # round(game_elo / 100), clipped
 
 
-def make_eval_step(model, data_sharding, repl):
-    def step(params, batch):
-        lm, lv, _ = model.apply({"params": params}, batch["board"], batch["self_elo"], batch["oppo_elo"],
-                                deterministic=True)
+def make_eval_step(graphdef: nnx.GraphDef, data_sharding, repl):
+    def step(params: nnx.State, batch: dict):
+        model = nnx.merge(graphdef, params)
+        lm, lv, _ = model(
+            batch["board"],
+            batch["self_elo"],
+            batch["oppo_elo"],
+            time_info=batch.get("time_info"),
+            deterministic=True,
+        )
         w = batch["weight"]
         legal = batch["legal"] | (w[:, None] == 0)
         masked = jnp.where(legal, lm, -jnp.inf)
@@ -57,7 +64,7 @@ def summarize(s: dict) -> dict:
     return {"overall": overall, "per_rating": per_bin}
 
 
-def run_eval(step_fn, params, global_batches) -> dict:
+def run_eval(step_fn, params: nnx.State, global_batches) -> dict:
     total = None
     for gb in global_batches:
         out = step_fn(params, gb)

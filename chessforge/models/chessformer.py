@@ -1,9 +1,9 @@
-"""Chessformer / Maia-3 in Flax linen. Parameter layout maps 1:1 onto maia3/models.py."""
+"""Chessformer / Maia-3 in Flax NNX. Parameter layout maps 1:1 onto maia3/models.py."""
 from __future__ import annotations
 
 import math
 
-import flax.linen as nn
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -27,21 +27,41 @@ def _normal(std: float):
     return init
 
 
-def torch_dense(features: int, fan_in: int, c: ModelConfig, name: str, use_bias: bool = True):
+def torch_linear(in_features: int, out_features: int, c: ModelConfig, *, rngs: nnx.Rngs,
+                 use_bias: bool = True, bound: float | None = None, zero_bias: bool = False) -> nnx.Linear:
     """nn.Linear default init: U(-1/sqrt(fan_in), 1/sqrt(fan_in)) for weight and bias."""
-    b = 1.0 / math.sqrt(fan_in)
-    return nn.Dense(features, use_bias=use_bias, dtype=c.dtype, param_dtype=c.pdtype,
-                    kernel_init=_uniform(b), bias_init=_uniform(b), name=name)
+    b = (1.0 / math.sqrt(in_features)) if bound is None else bound
+    b_init = nnx.initializers.zeros if zero_bias else _uniform(1.0 / math.sqrt(in_features))
+    return nnx.Linear(
+        in_features,
+        out_features,
+        use_bias=use_bias,
+        dtype=c.dtype,
+        param_dtype=c.pdtype,
+        kernel_init=_uniform(b),
+        bias_init=b_init,
+        rngs=rngs,
+    )
 
 
-def layer_norm(c: ModelConfig, name: str):
-    return nn.LayerNorm(epsilon=LN_EPS, dtype=jnp.float32, param_dtype=c.pdtype, name=name)
+def layer_norm(features: int, c: ModelConfig, *, rngs: nnx.Rngs) -> nnx.LayerNorm:
+    return nnx.LayerNorm(features, epsilon=LN_EPS, dtype=jnp.float32, param_dtype=c.pdtype, rngs=rngs)
 
 
-def block_norm(c: ModelConfig, name: str):
+def block_norm(features: int, c: ModelConfig, *, rngs: nnx.Rngs) -> nnx.Module:
     if c.use_rms_norm:
-        return nn.RMSNorm(epsilon=RMS_EPS, dtype=jnp.float32, param_dtype=c.pdtype, name=name)
-    return layer_norm(c, name)
+        return nnx.RMSNorm(features, epsilon=RMS_EPS, dtype=jnp.float32, param_dtype=c.pdtype, rngs=rngs)
+    return layer_norm(features, c, rngs=rngs)
+
+
+def _dropout(x: jax.Array, rate: float, deterministic: bool, rng: jax.Array | None) -> jax.Array:
+    if deterministic or rate <= 0.0:
+        return x
+    if rng is None:
+        raise ValueError("Dropout requires an RNG key when deterministic=False and dropout > 0.")
+    keep = 1.0 - rate
+    mask = jax.random.bernoulli(rng, p=keep, shape=x.shape)
+    return jnp.where(mask, x / keep, 0.0)
 
 
 def _rel_index() -> np.ndarray:
@@ -57,95 +77,157 @@ def _rel_index() -> np.ndarray:
 REL_INDEX = _rel_index()
 
 
-class RelativeBias(nn.Module):
-    num_heads: int
-    param_dtype: jnp.dtype = jnp.float32
+class RelativeBias(nnx.Module):
+    def __init__(self, num_heads: int, param_dtype: jnp.dtype = jnp.float32):
+        self.num_heads = num_heads
+        self.gate = nnx.Param(jnp.zeros((num_heads, 225), dtype=param_dtype))
 
-    @nn.compact
-    def __call__(self):
-        gate = self.param("gate", nn.initializers.zeros, (self.num_heads, 225), self.param_dtype)
-        return gate[:, REL_INDEX].astype(jnp.float32)  # (H, 64, 64)
+    def __call__(self) -> jax.Array:
+        return self.gate.value[:, REL_INDEX].astype(jnp.float32)  # (H, 64, 64)
 
 
-class GABGenerator(nn.Module):
+class GABGenerator(nnx.Module):
     """Geometric Attention Bias: compressed board state -> mix of shared bias templates."""
-    cfg: ModelConfig
 
-    @nn.compact
-    def __call__(self, x, gab_weight):
-        c = self.cfg
-        B, _, D = x.shape
-        gelu = lambda t: nn.gelu(t, approximate=False)
-        if c.gab_per_square_dim == 0:
-            y = gelu(torch_dense(c.gab_intermediate_dim, D, c, "sm2")(x.mean(axis=1)))
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        D = cfg.dim_vit
+        if cfg.gab_per_square_dim == 0:
+            self.sm1 = None
+            self.sm2 = torch_linear(D, cfg.gab_intermediate_dim, cfg, rngs=rngs)
         else:
-            y = torch_dense(c.gab_per_square_dim, D, c, "sm1")(x).reshape(B, -1)
-            y = gelu(torch_dense(c.gab_intermediate_dim, 64 * c.gab_per_square_dim, c, "sm2")(y))
-        y = layer_norm(c, "ln1")(y)
-        y = gelu(torch_dense(c.num_heads * c.gab_gen_size, c.gab_intermediate_dim, c, "sm3")(y))
-        y = layer_norm(c, "ln2")(y).reshape(B, c.num_heads, c.gab_gen_size)
+            self.sm1 = torch_linear(D, cfg.gab_per_square_dim, cfg, rngs=rngs)
+            self.sm2 = torch_linear(64 * cfg.gab_per_square_dim, cfg.gab_intermediate_dim, cfg, rngs=rngs)
+        self.ln1 = layer_norm(cfg.gab_intermediate_dim, cfg, rngs=rngs)
+        self.sm3 = torch_linear(cfg.gab_intermediate_dim, cfg.num_heads * cfg.gab_gen_size, cfg, rngs=rngs)
+        self.ln2 = layer_norm(cfg.num_heads * cfg.gab_gen_size, cfg, rngs=rngs)
+
+    def __call__(self, x: jax.Array, gab_weight: jax.Array) -> jax.Array:
+        c = self.cfg
+        B = x.shape[0]
+        gelu = lambda t: nnx.gelu(t, approximate=False)
+        if self.sm1 is None:
+            y = gelu(self.sm2(x.mean(axis=1)))
+        else:
+            y = self.sm1(x).reshape(B, -1)
+            y = gelu(self.sm2(y))
+        y = self.ln1(y)
+        y = gelu(self.sm3(y))
+        y = self.ln2(y).reshape(B, c.num_heads, c.gab_gen_size)
         b = jnp.einsum("bhg,og->bho", y.astype(c.dtype), gab_weight.astype(c.dtype),
                        preferred_element_type=jnp.float32)
         return b.reshape(B, c.num_heads, 64, 64)
 
 
-class MultiHeadAttention(nn.Module):
-    cfg: ModelConfig
+class MultiHeadAttention(nnx.Module):
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        D = cfg.dim_vit
+        use_bias = not cfg.omit_qkv_biases
+        in_bound = math.sqrt(6.0 / (D + 3 * D))  # xavier_uniform on torch's packed (3D, D) in_proj
+        self.q = torch_linear(D, D, cfg, rngs=rngs, use_bias=use_bias, bound=in_bound, zero_bias=True)
+        self.k = torch_linear(D, D, cfg, rngs=rngs, use_bias=use_bias, bound=in_bound, zero_bias=True)
+        self.v = torch_linear(D, D, cfg, rngs=rngs, use_bias=use_bias, bound=in_bound, zero_bias=True)
+        self.out = torch_linear(D, D, cfg, rngs=rngs, use_bias=use_bias, bound=1.0 / math.sqrt(D), zero_bias=True)
 
-    @nn.compact
-    def __call__(self, x, bias, deterministic: bool):
+    def __call__(self, x: jax.Array, bias: jax.Array | None, deterministic: bool,
+                 rng: jax.Array | None = None) -> jax.Array:
         c = self.cfg
         B, S, D = x.shape
         H = c.num_heads
         hd = D // H
-        use_bias = not c.omit_qkv_biases
-        in_bound = math.sqrt(6.0 / (D + 3 * D))  # xavier_uniform on torch's packed (3D, D) in_proj
-
-        def proj(name, bound):
-            return nn.Dense(D, use_bias=use_bias, dtype=c.dtype, param_dtype=c.pdtype,
-                            kernel_init=_uniform(bound), bias_init=nn.initializers.zeros, name=name)
-
-        q = proj("q", in_bound)(x).reshape(B, S, H, hd)
-        k = proj("k", in_bound)(x).reshape(B, S, H, hd)
-        v = proj("v", in_bound)(x).reshape(B, S, H, hd)
+        q = self.q(x).reshape(B, S, H, hd)
+        k = self.k(x).reshape(B, S, H, hd)
+        v = self.v(x).reshape(B, S, H, hd)
         logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) / math.sqrt(hd)
         if bias is not None:
             logits = logits + bias
         w = jax.nn.softmax(logits, axis=-1)
-        w = nn.Dropout(c.dropout)(w, deterministic=deterministic)
+        w = _dropout(w, c.dropout, deterministic, rng)
         out = jnp.einsum("bhqk,bkhd->bqhd", w.astype(c.dtype), v).reshape(B, S, D)
-        return proj("out", 1.0 / math.sqrt(D))(out)
+        return self.out(out)
 
 
-class EncoderBlock(nn.Module):
+class EncoderBlock(nnx.Module):
     """Post-norm transformer block (maia3 EncoderOnlyBlock)."""
-    cfg: ModelConfig
 
-    @nn.compact
-    def __call__(self, x, gab_weight, deterministic: bool):
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        D = cfg.dim_vit
+        hidden = int(D * cfg.mlp_ratio)
+        if cfg.pos_encoding == "gab":
+            self.gab = GABGenerator(cfg, rngs=rngs)
+        elif cfg.pos_encoding == "relative":
+            self.relative_bias = RelativeBias(cfg.num_heads, cfg.pdtype)
+        self.attn = MultiHeadAttention(cfg, rngs=rngs)
+        self.norm1 = block_norm(D, cfg, rngs=rngs)
+        self.linear1 = torch_linear(D, hidden, cfg, rngs=rngs)
+        self.linear2 = torch_linear(hidden, D, cfg, rngs=rngs)
+        self.norm2 = block_norm(D, cfg, rngs=rngs)
+
+    def __call__(self, x: jax.Array, gab_weight: jax.Array | None, deterministic: bool,
+                 rng: jax.Array | None = None) -> jax.Array:
         c = self.cfg
+        r_attn, r_d1, r_mlp, r_d2 = (None, None, None, None) if rng is None else jax.random.split(rng, 4)
         bias = None
         if c.pos_encoding == "gab":
-            bias = GABGenerator(c, name="gab")(x, gab_weight)
+            bias = self.gab(x, gab_weight)
         elif c.pos_encoding == "relative":
-            bias = RelativeBias(c.num_heads, c.pdtype, name="relative_bias")()[None]
-        a = MultiHeadAttention(c, name="attn")(x, bias, deterministic)
-        a = nn.Dropout(c.dropout)(a, deterministic=deterministic)
-        x = block_norm(c, "norm1")(x + a)  # residual stream kept in fp32
-        hidden = int(c.dim_vit * c.mlp_ratio)
-        act = (lambda t: nn.gelu(t, approximate=False)) if c.activation == "gelu" else nn.relu
-        h = act(torch_dense(hidden, c.dim_vit, c, "linear1")(x))
-        h = nn.Dropout(c.dropout)(h, deterministic=deterministic)
-        h = torch_dense(c.dim_vit, hidden, c, "linear2")(h)
-        h = nn.Dropout(c.dropout)(h, deterministic=deterministic)
-        return block_norm(c, "norm2")(x + h)
+            bias = self.relative_bias()[None]
+        a = self.attn(x, bias, deterministic, r_attn)
+        a = _dropout(a, c.dropout, deterministic, r_d1)
+        x = self.norm1(x + a.astype(jnp.float32))
+        act = (lambda t: nnx.gelu(t, approximate=False)) if c.activation == "gelu" else nnx.relu
+        h = act(self.linear1(x))
+        h = _dropout(h, c.dropout, deterministic, r_mlp)
+        h = self.linear2(h)
+        h = _dropout(h, c.dropout, deterministic, r_d2)
+        return self.norm2(x + h.astype(jnp.float32))
 
 
-class Chessformer(nn.Module):
-    cfg: ModelConfig
+class Chessformer(nnx.Module):
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        D, hh = cfg.dim_vit, cfg.head_hid_dim
+        std = math.sqrt(2.0 / (cfg.dim_emb + 1))  # xavier_normal on nn.Embedding(1, dim_emb)
+        self.elo_embedding_low = nnx.Param(_normal(std)(rngs.params(), (cfg.dim_emb,), cfg.pdtype))
+        self.elo_embedding_high = nnx.Param(_normal(std)(rngs.params(), (cfg.dim_emb,), cfg.pdtype))
 
-    @nn.compact
-    def __call__(self, boards, self_elo, oppo_elo, deterministic: bool = True):
+        extra_time = 3 if cfg.include_time_info else 0
+        in_dim = 12 * cfg.history + extra_time + 2 * cfg.dim_emb
+        self.token_projection = torch_linear(in_dim, D, cfg, rngs=rngs)
+
+        if cfg.pos_encoding == "absolute":
+            self.abs_pe = nnx.Param(jnp.zeros((64, D), dtype=cfg.pdtype))
+        if cfg.pos_encoding == "gab":
+            gstd = math.sqrt(2.0 / (64 * 64 + cfg.gab_gen_size))
+            self.gab_shared_weight = nnx.Param(
+                _normal(gstd)(rngs.params(), (64 * 64, cfg.gab_gen_size), cfg.pdtype))
+
+        for i in range(cfg.num_blocks):
+            setattr(self, f"block_{i}", EncoderBlock(cfg, rngs=rngs))
+        self.final_norm = layer_norm(D, cfg, rngs=rngs)
+        self.last_ln = layer_norm(D, cfg, rngs=rngs)
+
+        self.proj_sq_from = torch_linear(D, hh, cfg, rngs=rngs, use_bias=False)
+        self.proj_sq_to = torch_linear(D, hh, cfg, rngs=rngs, use_bias=False)
+        self.promo_bias_proj = torch_linear(hh, 4, cfg, rngs=rngs, use_bias=False)
+
+        self.fc_value_hid = torch_linear(D, hh, cfg, rngs=rngs)
+        self.fc_value = torch_linear(hh, 3, cfg, rngs=rngs)
+        self.fc_ponder_hid = torch_linear(D, hh, cfg, rngs=rngs)
+        self.fc_ponder = torch_linear(hh, 1, cfg, rngs=rngs)
+
+    def __call__(
+        self,
+        boards: jax.Array,
+        self_elo: jax.Array,
+        oppo_elo: jax.Array,
+        *,
+        time_info: jax.Array | None = None,
+        deterministic: bool = True,
+        rng: jax.Array | None = None,
+    ):
         """boards: int8 (B, history, 64) relative piece codes (0 empty, 1..6 own, 7..12 opp).
         Returns logits_move (B, 4352), logits_value (B, 3) [loss, draw, win], ponder (B,)."""
         c = self.cfg
@@ -156,47 +238,50 @@ class Chessformer(nn.Module):
         onehot = (boards[..., None] == jnp.arange(1, 13, dtype=boards.dtype)).astype(cdt)
         tokens = onehot.transpose(0, 2, 1, 3).reshape(B, 64, H * 12)  # oldest board first
 
-        std = math.sqrt(2.0 / (c.dim_emb + 1))  # xavier_normal on nn.Embedding(1, dim_emb)
-        e_low = self.param("elo_embedding_low", _normal(std), (c.dim_emb,), c.pdtype)
-        e_high = self.param("elo_embedding_high", _normal(std), (c.dim_emb,), c.pdtype)
+        if c.include_time_info:
+            if time_info is None:
+                t_feat = jnp.zeros((B, 64, 3), dtype=cdt)
+            else:
+                t_feat = jnp.broadcast_to(time_info[:, None, :].astype(cdt), (B, 64, 3))
+            tokens = jnp.concatenate([tokens, t_feat], axis=-1)
+
+        e_low = self.elo_embedding_low.value.astype(jnp.float32)
+        e_high = self.elo_embedding_high.value.astype(jnp.float32)
 
         def interp(elo):
             elo = jnp.clip(elo.astype(jnp.float32), 0.0, c.elo_max)
             w = (elo / c.elo_max)[:, None]
-            emb = w * e_low.astype(jnp.float32) + (1.0 - w) * e_high.astype(jnp.float32)
+            emb = w * e_low + (1.0 - w) * e_high
             return jnp.broadcast_to(emb[:, None, :], (B, 64, c.dim_emb)).astype(cdt)
 
         x = jnp.concatenate([tokens, interp(self_elo), interp(oppo_elo)], axis=-1)
-        x = torch_dense(c.dim_vit, x.shape[-1], c, "token_projection")(x)
+        x = self.token_projection(x).astype(jnp.float32)  # keep residual stream in fp32
 
         if c.pos_encoding == "absolute":
-            x = x + self.param("abs_pe", nn.initializers.zeros, (64, c.dim_vit), c.pdtype).astype(cdt)
-        gab_w = None
-        if c.pos_encoding == "gab":
-            gstd = math.sqrt(2.0 / (64 * 64 + c.gab_gen_size))
-            gab_w = self.param("gab_shared_weight", _normal(gstd), (64 * 64, c.gab_gen_size), c.pdtype)
+            x = x + self.abs_pe.value.astype(jnp.float32)
+        gab_w = self.gab_shared_weight.value if c.pos_encoding == "gab" else None
 
+        blk_rngs = [None] * c.num_blocks if rng is None else list(jax.random.split(rng, c.num_blocks))
         for i in range(c.num_blocks):
-            x = EncoderBlock(c, name=f"block_{i}")(x, gab_w, deterministic)
-        x = layer_norm(c, "final_norm")(x)
+            blk: EncoderBlock = getattr(self, f"block_{i}")
+            x = blk(x, gab_w, deterministic, blk_rngs[i])
+        x = self.final_norm(x)
 
-        # attention-style from-to policy head with promotion biases
         hh = c.head_hid_dim
-        sq_from = torch_dense(hh, c.dim_vit, c, "proj_sq_from", use_bias=False)(x)
-        sq_to = torch_dense(hh, c.dim_vit, c, "proj_sq_to", use_bias=False)(x)
+        sq_from = self.proj_sq_from(x)
+        sq_to = self.proj_sq_to(x)
         scores = jnp.einsum("bid,bjd->bij", sq_from, sq_to, preferred_element_type=jnp.float32) / math.sqrt(hh)
-        promo_bias = torch_dense(4, hh, c, "promo_bias_proj", use_bias=False)(sq_to[:, 56:64])
-        promo_bias = promo_bias.astype(jnp.float32) * math.sqrt(hh)                 # (B, 8 to-file, 4)
-        base = scores[:, 48:56, 56:64]                                               # rank7 -> rank8
-        promo = (base[..., None] + promo_bias[:, None, :, :]).reshape(B, 256)        # from, to, qrbn
+        promo_bias = self.promo_bias_proj(sq_to[:, 56:64]).astype(jnp.float32) * math.sqrt(hh)  # (B, 8, 4)
+        base = scores[:, 48:56, 56:64]                                                           # rank7 -> rank8
+        promo = (base[..., None] + promo_bias[:, None, :, :]).reshape(B, 256)
         logits_move = jnp.concatenate([scores.reshape(B, 64 * 64), promo], axis=-1)
         assert logits_move.shape[-1] == VOCAB_SIZE
 
-        pooled = layer_norm(c, "last_ln")(x.mean(axis=1))
-        v = nn.relu(torch_dense(hh, c.dim_vit, c, "fc_value_hid")(pooled))
-        logits_value = torch_dense(3, hh, c, "fc_value")(v).astype(jnp.float32)
-        p = nn.relu(torch_dense(hh, c.dim_vit, c, "fc_ponder_hid")(pooled))
-        ponder = torch_dense(1, hh, c, "fc_ponder")(p).astype(jnp.float32)[:, 0]
+        pooled = self.last_ln(x.mean(axis=1))
+        v = nnx.relu(self.fc_value_hid(pooled))
+        logits_value = self.fc_value(v).astype(jnp.float32)
+        p = nnx.relu(self.fc_ponder_hid(pooled))
+        ponder = self.fc_ponder(p).astype(jnp.float32)[:, 0]
         return logits_move, logits_value, ponder
 
 

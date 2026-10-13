@@ -1,5 +1,5 @@
 jax[tpu]>=0.4.30
-flax>=0.8.5
+flax>=0.10.2
 optax>=0.2.2
 orbax-checkpoint>=0.5.20
 grain>=0.2.2

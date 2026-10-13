@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 import flax
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,7 +18,6 @@ from ..config import TrainConfig, config_to_dict
 from ..data import pipeline
 from ..eval.evaluate import make_eval_step, run_eval
 from ..models import build_model, build_model_config, count_params
-from ..models.chessformer import dummy_inputs
 from .losses import maia3_loss
 from .schedule import maia3_lr_schedule
 
@@ -45,7 +45,7 @@ class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.model_cfg = build_model_config(cfg.model, cfg.model_overrides)
-        self.model = build_model(self.model_cfg)
+        self.graphdef, _ = nnx.split(build_model(self.model_cfg, rngs=0))
         self.mesh = Mesh(np.asarray(jax.devices()), ("data",))
         self.data_sharding = NamedSharding(self.mesh, P("data"))
         self.repl = NamedSharding(self.mesh, P())
@@ -60,17 +60,25 @@ class Trainer:
 
     # ------------------------------------------------------------------ setup
     def _init_state(self, rng):
-        params = self.model.init(rng, *dummy_inputs(self.model_cfg))["params"]
+        model = build_model(self.model_cfg, rngs=nnx.Rngs(params=rng))
+        _, params = nnx.split(model)
         return TrainState(step=jnp.zeros((), jnp.int32), params=params, opt_state=self.tx.init(params))
 
     def _build_fns(self):
-        cfg, model = self.cfg, self.model
+        cfg, graphdef = self.cfg, self.graphdef
         accum = cfg.optim.grad_accum_steps
         deterministic = self.model_cfg.dropout == 0.0
 
         def loss_fn(params, batch, rng):
-            lm, lv, lp = model.apply({"params": params}, batch["board"], batch["self_elo"], batch["oppo_elo"],
-                                     deterministic=deterministic, rngs={"dropout": rng})
+            model = nnx.merge(graphdef, params)
+            lm, lv, lp = model(
+                batch["board"],
+                batch["self_elo"],
+                batch["oppo_elo"],
+                time_info=batch.get("time_info"),
+                deterministic=deterministic,
+                rng=rng,
+            )
             return maia3_loss(lm, lv, lp, batch, value_coef=cfg.value_coef, ponder_coef=cfg.ponder_coef,
                               mask_illegal=cfg.mask_illegal_in_loss)
 
@@ -81,7 +89,6 @@ class Trainer:
             if accum == 1:
                 (_, metrics), grads = grad_fn(state.params, batch, rng)
             else:
-                # interleave so every device contributes equally to each micro-batch
                 mbs = jax.tree.map(lambda x: x.reshape(-1, accum, *x.shape[1:]).swapaxes(0, 1), batch)
                 mbs = jax.lax.with_sharding_constraint(mbs, NamedSharding(self.mesh, P(None, "data")))
 
@@ -106,7 +113,7 @@ class Trainer:
                                     out_shardings=(self.repl, self.repl), donate_argnums=(0,))
         self.p_init = jax.jit(self._init_state, out_shardings=self.repl)
         self.p_add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
-        self.eval_step = make_eval_step(self.model, self.data_sharding, self.repl)
+        self.eval_step = make_eval_step(self.graphdef, self.data_sharding, self.repl)
 
     def to_global(self, batch):
         return jax.tree.map(lambda x: jax.make_array_from_process_local_data(self.data_sharding, x), batch)
@@ -134,14 +141,14 @@ class Trainer:
             log0(f"Restored checkpoint at step {latest}")
         return state, latest
 
-    def restore_params(self, step: int | None = None):
+    def restore_params(self, step: int | None = None) -> nnx.State:
         state = jax.eval_shape(self._init_state, jax.random.PRNGKey(0))
         abstract = jax.tree.map(lambda s: jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=self.repl), state)
         step = self.ckpt.latest_step() if step is None else step
         return self.ckpt.restore(step, args=ocp.args.StandardRestore(abstract)).params
 
     # -------------------------------------------------------------------- eval
-    def evaluate(self, params, pattern: str, max_batches: int | None = None) -> dict:
+    def evaluate(self, params: nnx.State, pattern: str, max_batches: int | None = None) -> dict:
         d = self.cfg.data
         batches = pipeline.eval_batches(pattern, self.model_cfg.history, d.eval_batch_size,
                                         d.local_cache_dir, max_batches, d.read_threads)

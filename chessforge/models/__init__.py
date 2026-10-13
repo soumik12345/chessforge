@@ -1,18 +1,16 @@
-"""Model garden: named presets + architecture registry + released-checkpoint index."""
+"""Model garden: named presets + NNX architecture registry + released-checkpoint index."""
 from __future__ import annotations
 
-import dataclasses
-
+from flax import nnx
 import jax
 import numpy as np
 
 from ..config import ModelConfig
-from .chessformer import Chessformer, dummy_inputs
+from .chessformer import Chessformer
 
 _ARCHS = {"chessformer": Chessformer}
 _PRESETS: dict[str, dict] = {}
 
-# Released PyTorch checkpoints (Hugging Face) for conversion / validation.
 HF_CHECKPOINTS = {
     "maia3-3m": ("UofTCSSLab/Maia3-ablate-3M", "maia3-3m.pt"),
     "maia3-5m": ("UofTCSSLab/Maia3-5M", "maia3-5m.pt"),
@@ -29,7 +27,6 @@ def register_preset(name: str, **kwargs):
     _PRESETS[name] = dict(name=name, **kwargs)
 
 
-# Values copied from maia3/model_registry.py
 register_preset("maia3-3m", dim_vit=192, head_hid_dim=192, num_heads=6,
                 gab_gen_size=64, gab_per_square_dim=0, gab_intermediate_dim=64)
 register_preset("maia3-5m", dim_vit=256, head_hid_dim=256, num_heads=8,
@@ -38,7 +35,6 @@ register_preset("maia3-23m", dim_vit=512, head_hid_dim=512, num_heads=16,
                 gab_gen_size=128, gab_per_square_dim=32, gab_intermediate_dim=128)
 register_preset("maia3-79m", dim_vit=1024, head_hid_dim=1024, num_heads=32,
                 gab_gen_size=128, gab_per_square_dim=32, gab_intermediate_dim=128)
-# Paper ablations (Table 7 / 8)
 register_preset("maia3-5m-absolute", **{**_PRESETS["maia3-5m"], "name": "maia3-5m-absolute", "pos_encoding": "absolute"})
 register_preset("maia3-5m-relative", **{**_PRESETS["maia3-5m"], "name": "maia3-5m-relative", "pos_encoding": "relative"})
 register_preset("maia3-5m-hist1", **{**_PRESETS["maia3-5m"], "name": "maia3-5m-hist1", "history": 1})
@@ -57,11 +53,15 @@ def build_model_config(name: str, overrides: dict | None = None) -> ModelConfig:
     return ModelConfig(**kw)
 
 
-def build_model(cfg: ModelConfig):
-    return _ARCHS[cfg.arch](cfg)
+def build_model(cfg: ModelConfig, *, rngs: nnx.Rngs | int = 0) -> nnx.Module:
+    if isinstance(rngs, int):
+        rngs = nnx.Rngs(rngs)
+    return _ARCHS[cfg.arch](cfg, rngs=rngs)
 
 
 def count_params(cfg: ModelConfig) -> int:
-    model = build_model(cfg)
-    shapes = jax.eval_shape(lambda: model.init(jax.random.PRNGKey(0), *dummy_inputs(cfg)))
-    return int(sum(np.prod(x.shape) for x in jax.tree.leaves(shapes["params"])))
+    def _make():
+        _, state = nnx.split(build_model(cfg, rngs=0))
+        return state
+    shapes = jax.eval_shape(_make)
+    return int(sum(np.prod(x.shape) for x in jax.tree.leaves(shapes)))

@@ -1,0 +1,31 @@
+name: Ruff Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check lint
+        uses: astral-sh/ruff-action@v4.1.0
+        with:
+          version-file: uv.lock
+          args: check --output-format=github
+
+  format:
+    name: Ruff format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check formatting
+        uses: astral-sh/ruff-action@v4.1.0
+        with:
+          version-file: uv.lock
+          args: format --check --diff

@@ -1,0 +1,18 @@
+model: maia3-79m                    # or maia3-23m
+workdir: gs://YOUR_BUCKET/maia3/runs/maia3-79m
+data:
+  train_glob: /mnt/maia3data/train/*/train/*.array_record
+  val_glob: /mnt/maia3data/train/*/val/*.array_record
+  test_glob: /mnt/maia3data/allie_test/*.array_record
+  global_batch_size: 4096          # 128/GPU x accum 4 x 8 GPUs (assumed)
+  eval_batch_size: 4096
+  num_workers: 48
+optim:
+  lr: 5.0e-5
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-6
+  grad_clip_norm: 3.5
+  warmup_steps: 1000
+  cosine_cycle_steps: 50000
+  total_steps: 1000000
+value_coef: 0.1

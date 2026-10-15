@@ -1,0 +1,7 @@
+model: maia3-5m-relative
+workdir: gs://YOUR_BUCKET/maia3/runs/maia3-5m-relative
+data:
+  train_glob: /mnt/maia3data/train/*/train/*.array_record
+  val_glob: /mnt/maia3data/train/*/val/*.array_record
+  test_glob: /mnt/maia3data/allie_test/*.array_record
+  global_batch_size: 1024

@@ -15,15 +15,17 @@ import numpy as np
 
 from chessforge.data import pgn
 
-_CFG = None
+_CFG: pgn.PositionConfig | None = None
 
 
-def _init(cfg):
+def _init(cfg: pgn.PositionConfig):
     global _CFG
     _CFG = cfg
 
 
 def _work(item):
+    if _CFG is None:
+        raise RuntimeError("Evaluation worker has not been initialized")
     h, mt = item
     try:
         return pgn.game_to_records(h, mt, _CFG)

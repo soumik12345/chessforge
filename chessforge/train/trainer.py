@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, cast
 
-import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from etils import epath
-from flax import nnx
+from flax import nnx, struct
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from chessforge.config import TrainConfig, config_to_dict
@@ -22,7 +21,7 @@ from chessforge.train.losses import maia3_loss
 from chessforge.train.schedule import maia3_lr_schedule
 
 
-@flax.struct.dataclass
+@struct.dataclass
 class TrainState:
     step: jnp.ndarray
     params: Any
@@ -187,7 +186,11 @@ class Trainer:
         latest = self.ckpt.latest_step()
         if latest is not None:
             abstract = jax.tree.map(ocp.utils.to_shape_dtype_struct, state)
-            state = self.ckpt.restore(latest, args=ocp.args.StandardRestore(abstract))
+            # StandardRestore reconstructs the TrainState supplied as its target.
+            state = cast(
+                TrainState,
+                self.ckpt.restore(latest, args=ocp.args.StandardRestore(abstract)),
+            )
             log0(f"Restored checkpoint at step {latest}")
         return state, latest
 
@@ -197,7 +200,11 @@ class Trainer:
             lambda s: jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=self.repl), state
         )
         step = self.ckpt.latest_step() if step is None else step
-        return self.ckpt.restore(step, args=ocp.args.StandardRestore(abstract)).params
+        restored = cast(
+            TrainState,
+            self.ckpt.restore(step, args=ocp.args.StandardRestore(abstract)),
+        )
+        return restored.params
 
     # -------------------------------------------------------------------- eval
     def evaluate(

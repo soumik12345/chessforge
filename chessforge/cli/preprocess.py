@@ -18,12 +18,14 @@ _CFG: pgn.PositionConfig | None = None
 _VAL_PERMILLE = 0
 
 
-def _init(cfg, val_permille):
+def _init(cfg: pgn.PositionConfig, val_permille: int):
     global _CFG, _VAL_PERMILLE
     _CFG, _VAL_PERMILLE = cfg, val_permille
 
 
 def _work(item):
+    if _CFG is None:
+        raise RuntimeError("Preprocessing worker has not been initialized")
     h, mt = item
     is_val = pgn.stable_hash(pgn.game_id(h, mt)) % 1000 < _VAL_PERMILLE
     try:

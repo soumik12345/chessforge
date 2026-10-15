@@ -234,6 +234,8 @@ class EncoderBlock(nnx.Module):
         )
         bias = None
         if c.pos_encoding == "gab":
+            if gab_weight is None:
+                raise ValueError("GAB positional encoding requires shared bias weights")
             bias = self.gab(x, gab_weight)
         elif c.pos_encoding == "relative":
             bias = self.relative_bias()[None]

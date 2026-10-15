@@ -1,6 +1,7 @@
 """Forward-pass parity of the Flax NNX model against maia3.models.MAIA3Model (fp32)."""
 
 from argparse import Namespace
+from typing import cast
 
 import jax.numpy as jnp
 import numpy as np
@@ -8,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("maia3")
-from maia3.models import MAIA3Model  # noqa: E402
+from maia3.models import EncoderOnlyBlock, MAIA3Model  # noqa: E402
 
 from chessforge.models import build_model_config  # noqa: E402
 from chessforge.models.convert_torch import convert  # noqa: E402
@@ -44,7 +45,8 @@ def test_parity_nnx(preset):
     c = build_model_config(preset, {"compute_dtype": "float32"})
     tm = MAIA3Model(torch_ns(c)).eval()
     if c.pos_encoding == "relative":
-        for blk in tm.transformer.layers:
+        for layer in tm.transformer.layers:
+            blk = cast(EncoderOnlyBlock, layer)
             torch.nn.init.normal_(blk.self_attn.relative_bias.gate, std=0.5)
     if c.pos_encoding == "absolute":
         torch.nn.init.normal_(tm.abs_pe.bias, std=0.5)

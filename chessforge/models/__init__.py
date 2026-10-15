@@ -64,18 +64,13 @@ register_preset(
     gab_per_square_dim=32,
     gab_intermediate_dim=128,
 )
-register_preset(
-    **{**_PRESETS["maia3-5m"], "name": "maia3-5m-absolute", "pos_encoding": "absolute"},
-)
-register_preset(
-    **{**_PRESETS["maia3-5m"], "name": "maia3-5m-relative", "pos_encoding": "relative"},
-)
-register_preset(
-    **{**_PRESETS["maia3-5m"], "name": "maia3-5m-hist1", "history": 1}
-)
-register_preset(
-    **{**_PRESETS["maia3-5m"], "name": "maia3-5m-hist32", "history": 32},
-)
+_maia3_5m_options = {
+    key: value for key, value in _PRESETS["maia3-5m"].items() if key != "name"
+}
+register_preset("maia3-5m-absolute", **_maia3_5m_options, pos_encoding="absolute")
+register_preset("maia3-5m-relative", **_maia3_5m_options, pos_encoding="relative")
+register_preset("maia3-5m-hist1", **_maia3_5m_options, history=1)
+register_preset("maia3-5m-hist32", **_maia3_5m_options, history=32)
 
 
 def list_presets() -> list[str]:

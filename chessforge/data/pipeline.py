@@ -6,11 +6,13 @@ import glob as globlib
 import math
 import os
 import shutil
+from typing import cast
 
 import grain.python as pygrain
 import jax
 import numpy as np
 from etils import epath
+from grain.sources import RandomAccessDataSource
 from jax.experimental import multihost_utils
 
 from chessforge import chess_utils as cu
@@ -70,7 +72,7 @@ def empty_batch(
     return out
 
 
-class FeaturizeTransform(pygrain.RandomMapTransform):
+class FeaturizeTransform:
     """bytes -> dict of numpy arrays. Board one-hot happens on device (int8 over PCIe)."""
 
     def __init__(
@@ -80,8 +82,8 @@ class FeaturizeTransform(pygrain.RandomMapTransform):
         self.history_mask_prob = history_mask_prob
         self.with_legal = with_legal
 
-    def random_map(self, raw: bytes, rng: np.random.Generator):
-        rec, legal = records.decode_position(raw)
+    def __call__(self, element: bytes, rng: np.random.Generator):
+        rec, legal = records.decode_position(element)
         stored = rec["boards"].shape[0]
         if self.history > stored:
             raise ValueError(
@@ -131,7 +133,9 @@ def _host_dataset(pattern: str, cache_dir: str):
     if shard_by_file:
         files = files[pidx::pcount]
     files = stage_files(files, cache_dir)
-    ds = pygrain.MapDataset.source(pygrain.ArrayRecordDataSource(files))
+    # ArrayRecord's untyped base class supplies the random-access methods.
+    source = cast(RandomAccessDataSource[bytes], pygrain.ArrayRecordDataSource(files))
+    ds = pygrain.MapDataset.source(source)
     if not shard_by_file:
         ds = ds[pidx::pcount]
     return ds

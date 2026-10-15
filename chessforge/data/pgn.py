@@ -279,6 +279,7 @@ class ShardedWriter:
     def write(self, payload: bytes):
         if self._w is None or self._n >= self.rps:
             self._rotate()
+        assert self._w is not None
         self._w.write(payload)
         self._n += 1
         self.total += 1

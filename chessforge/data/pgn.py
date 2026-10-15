@@ -13,6 +13,7 @@ from typing import Iterable, Iterator
 import chess
 import numpy as np
 import zstandard
+from array_record.python.array_record_module import ArrayRecordWriter
 
 from chessforge import chess_utils as cu
 from chessforge.data import records
@@ -269,8 +270,6 @@ def game_to_records(h: dict, movetext: str, cfg: PositionConfig) -> list[bytes]:
 
 class ShardedWriter:
     def __init__(self, out_dir: str, prefix: str, records_per_shard: int = 100_000):
-        from array_record.python.array_record_module import ArrayRecordWriter
-
         self._cls = ArrayRecordWriter
         os.makedirs(out_dir, exist_ok=True)
         self.out_dir, self.prefix, self.rps = out_dir, prefix, records_per_shard

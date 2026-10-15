@@ -14,12 +14,12 @@ import orbax.checkpoint as ocp
 from etils import epath
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ..config import TrainConfig, config_to_dict
-from ..data import pipeline
-from ..eval.evaluate import make_eval_step, run_eval
-from ..models import build_model, build_model_config, count_params
-from .losses import maia3_loss
-from .schedule import maia3_lr_schedule
+from chessforge.config import TrainConfig, config_to_dict
+from chessforge.data import pipeline
+from chessforge.eval.evaluate import make_eval_step, run_eval
+from chessforge.models import build_model, build_model_config, count_params
+from chessforge.train.losses import maia3_loss
+from chessforge.train.schedule import maia3_lr_schedule
 
 
 @flax.struct.dataclass

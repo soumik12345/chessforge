@@ -12,7 +12,7 @@ import os
 
 import numpy as np
 
-from ..data import pgn
+from chessforge.data import pgn
 
 _CFG = None
 

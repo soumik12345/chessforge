@@ -5,8 +5,8 @@ from flax import nnx
 import jax
 import numpy as np
 
-from ..config import ModelConfig
-from .chessformer import Chessformer
+from chessforge.config import ModelConfig
+from chessforge.models.chessformer import Chessformer
 
 _ARCHS = {"chessformer": Chessformer}
 _PRESETS: dict[str, dict] = {}

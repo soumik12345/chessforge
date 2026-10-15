@@ -13,8 +13,8 @@ import chess
 import numpy as np
 import zstandard
 
-from .. import chess_utils as cu
-from . import records
+from chessforge import chess_utils as cu
+from chessforge.data import records
 
 HEADER_RE = re.compile(r'^\[(\w+)\s+"(.*)"\]\s*$')
 MOVE_RE = re.compile(r"([^\s{}()]+)\s*\{([^}]*)\}")

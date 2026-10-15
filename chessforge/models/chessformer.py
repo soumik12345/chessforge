@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..chess_utils import VOCAB_SIZE
-from ..config import ModelConfig
+from chessforge.chess_utils import VOCAB_SIZE
+from chessforge.config import ModelConfig
 
 LN_EPS = 1e-5
 RMS_EPS = float(np.finfo(np.float32).eps)  # torch.nn.RMSNorm(eps=None) default

@@ -11,7 +11,7 @@ import multiprocessing as mp
 import os
 import time
 
-from ..data import pgn
+from chessforge.data import pgn
 
 _CFG: pgn.PositionConfig | None = None
 _VAL_PERMILLE = 0

@@ -12,8 +12,8 @@ import numpy as np
 from etils import epath
 from jax.experimental import multihost_utils
 
-from .. import chess_utils as cu
-from . import records
+from chessforge import chess_utils as cu
+from chessforge.data import records
 
 
 def list_files(pattern: str) -> list[str]:

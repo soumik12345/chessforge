@@ -6,8 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..config import ModelConfig
-from . import build_model
+from chessforge.config import ModelConfig
+from chessforge.models import build_model
 
 
 def load_torch_state_dict(path: str, trust: bool = False) -> dict[str, np.ndarray]:

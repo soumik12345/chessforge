@@ -50,6 +50,11 @@ build = [
     "build>=0.10",
     "pyinstaller>=6.0",
 ]
+test = [
+    "maia3",
+    "pytest>=8.3.3",
+    "torch>=2.14.1",
+]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -85,6 +90,15 @@ environments = [
     "sys_platform == 'darwin'",
     "sys_platform == 'win32'",
 ]
+
+[tool.uv.sources]
+maia3 = { git = "https://github.com/CSSLab/maia3" }
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

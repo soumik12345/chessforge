@@ -11,20 +11,21 @@ import yaml
 @dataclass(frozen=True)
 class ModelConfig:
     """Architecture config. Field semantics mirror maia3/model_registry.py."""
+
     name: str = "maia3-5m"
     arch: str = "chessformer"
-    history: int = 8               # boards incl. current (paper's n = history - 1)
+    history: int = 8  # boards incl. current (paper's n = history - 1)
     include_time_info: bool = False
-    dim_emb: int = 128             # Elo soft-embedding dim
+    dim_emb: int = 128  # Elo soft-embedding dim
     dim_vit: int = 256
     num_blocks: int = 8
     num_heads: int = 8
     mlp_ratio: float = 2.0
     dropout: float = 0.0
     head_hid_dim: int = 256
-    pos_encoding: str = "gab"      # gab | relative | absolute
+    pos_encoding: str = "gab"  # gab | relative | absolute
     gab_gen_size: int = 64
-    gab_per_square_dim: int = 0    # 0 => average pooling variant (3M/5M)
+    gab_per_square_dim: int = 0  # 0 => average pooling variant (3M/5M)
     gab_intermediate_dim: int = 64
     use_rms_norm: bool = True
     omit_qkv_biases: bool = True
@@ -36,11 +37,13 @@ class ModelConfig:
     @property
     def dtype(self):
         import jax.numpy as jnp
+
         return jnp.dtype(self.compute_dtype)
 
     @property
     def pdtype(self):
         import jax.numpy as jnp
+
         return jnp.dtype(self.param_dtype)
 
 
@@ -48,15 +51,15 @@ class ModelConfig:
 class DataConfig:
     train_glob: str = ""
     val_glob: str = ""
-    test_glob: str = ""            # ALLIE test set converted with cli/prepare_eval.py
+    test_glob: str = ""  # ALLIE test set converted with cli/prepare_eval.py
     global_batch_size: int = 1024  # positions per optimizer step (all hosts)
     eval_batch_size: int = 2048
     history_mask_prob: float = 0.05
     shuffle_seed: int = 0
-    num_workers: int = 16          # grain multiprocessing workers per host
+    num_workers: int = 16  # grain multiprocessing workers per host
     read_threads: int = 16
     prefetch_buffer_size: int = 256
-    local_cache_dir: str = ""      # stage gs:// shards to local disk if set
+    local_cache_dir: str = ""  # stage gs:// shards to local disk if set
     val_batches: int = 50
 
 
@@ -121,7 +124,9 @@ def _apply_override(d: dict, override: str):
     cur[parts[-1]] = yaml.safe_load(raw)
 
 
-def load_train_config(path: str | None, overrides: list[str] | None = None) -> TrainConfig:
+def load_train_config(
+    path: str | None, overrides: list[str] | None = None
+) -> TrainConfig:
     d: dict = {}
     if path:
         with open(path) as fh:

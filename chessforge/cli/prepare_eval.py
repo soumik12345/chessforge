@@ -3,6 +3,7 @@
 ALLIE protocol: drop first 10 (ply), truncate after first time a player has < 30 s.
 Sanity check: the ALLIE test set should produce 884,049 positions.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,18 +39,32 @@ def main():
     ap.add_argument("--skip_first_plies", type=int, default=10)
     ap.add_argument("--min_clock", type=float, default=30.0)
     ap.add_argument("--store_history", type=int, default=8)
-    ap.add_argument("--filter_game_type", default="", help="e.g. Blitz to apply rated-blitz filter")
-    ap.add_argument("--sample_prob", type=float, default=1.0, help="reconstruct: keep games w.p.")
+    ap.add_argument(
+        "--filter_game_type", default="", help="e.g. Blitz to apply rated-blitz filter"
+    )
+    ap.add_argument(
+        "--sample_prob", type=float, default=1.0, help="reconstruct: keep games w.p."
+    )
     ap.add_argument("--max_games", type=int, default=0)
-    ap.add_argument("--per_rating_bucket_cap", type=int, default=0, help="ALLIE-augmented style cap")
-    ap.add_argument("--only_buckets", default="", help="comma list of rounded ratings, e.g. 600,700,2800")
+    ap.add_argument(
+        "--per_rating_bucket_cap", type=int, default=0, help="ALLIE-augmented style cap"
+    )
+    ap.add_argument(
+        "--only_buckets",
+        default="",
+        help="comma list of rounded ratings, e.g. 600,700,2800",
+    )
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 2))
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
-    cfg = pgn.PositionConfig(store_history=a.store_history, positions_per_game=0,
-                             skip_first_plies=a.skip_first_plies, min_clock_seconds=a.min_clock,
-                             store_legal=True)
+    cfg = pgn.PositionConfig(
+        store_history=a.store_history,
+        positions_per_game=0,
+        skip_first_plies=a.skip_first_plies,
+        min_clock_seconds=a.min_clock,
+        store_legal=True,
+    )
     filt = pgn.GameFilter(game_type=a.filter_game_type) if a.filter_game_type else None
     only = {int(x) for x in a.only_buckets.split(",") if x}
     rng = np.random.default_rng(a.seed)
@@ -63,12 +78,18 @@ def main():
             if "TimeControl" not in h or "+" not in h["TimeControl"]:
                 continue
             try:
-                bucket = int(round((int(h["WhiteElo"]) + int(h["BlackElo"])) / 2 / 100)) * 100
+                bucket = (
+                    int(round((int(h["WhiteElo"]) + int(h["BlackElo"])) / 2 / 100))
+                    * 100
+                )
             except (KeyError, ValueError):
                 continue
             if only and bucket not in only:
                 continue
-            if a.per_rating_bucket_cap and caps.get(bucket, 0) >= a.per_rating_bucket_cap:
+            if (
+                a.per_rating_bucket_cap
+                and caps.get(bucket, 0) >= a.per_rating_bucket_cap
+            ):
                 continue
             if a.sample_prob < 1.0 and rng.random() > a.sample_prob:
                 continue

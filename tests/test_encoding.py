@@ -1,4 +1,5 @@
 """Encoding parity vs the official maia3 package (pip install git+https://github.com/CSSLab/maia3)."""
+
 import random
 from argparse import Namespace
 from collections import deque
@@ -33,10 +34,12 @@ def test_history_tokens(seed):
     for ply in range(60):
         hist_t.append(tokenize_board(board))
         hist_codes.append(cu.board_codes(board))
-        ref = get_historical_tokens(hist_t, cfg, 0, 0, 0, 0)[:, :12 * H].numpy()
+        ref = get_historical_tokens(hist_t, cfg, 0, 0, 0, 0)[:, : 12 * H].numpy()
         codes = np.zeros((H, 64), np.int8)
-        codes[H - len(hist_codes):] = np.stack(hist_codes)
-        rel = cu.to_relative_codes(codes, int(board.turn == chess.BLACK), len(hist_codes) - 1)
+        codes[H - len(hist_codes) :] = np.stack(hist_codes)
+        rel = cu.to_relative_codes(
+            codes, int(board.turn == chess.BLACK), len(hist_codes) - 1
+        )
         np.testing.assert_array_equal(_onehot(rel), ref)
         moves = list(board.legal_moves)
         if not moves:

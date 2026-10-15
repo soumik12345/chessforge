@@ -1,8 +1,9 @@
 """Evaluate either a released Maia-3 checkpoint (validation of this codebase) or our own run.
 
-  python -m chessforge.cli.eval --released maia3-5m --test_glob '/data/allie_test/*.array_record'
-  python -m chessforge.cli.eval --config configs/maia3_5m.yaml
+python -m chessforge.cli.eval --released maia3-5m --test_glob '/data/allie_test/*.array_record'
+python -m chessforge.cli.eval --config configs/maia3_5m.yaml
 """
+
 import argparse
 import json
 
@@ -20,6 +21,7 @@ def main():
     a = ap.parse_args()
 
     import jax
+
     try:
         jax.distributed.initialize()
     except Exception:  # noqa: BLE001
@@ -32,7 +34,11 @@ def main():
         overrides.append(f"data.test_glob={a.test_glob}")
     if a.released:
         from ..models.convert_torch import load_released
-        overrides += [f"model={a.released}", f"model_overrides={{compute_dtype: {a.compute_dtype}}}"]
+
+        overrides += [
+            f"model={a.released}",
+            f"model_overrides={{compute_dtype: {a.compute_dtype}}}",
+        ]
         trainer = Trainer(load_train_config(a.config, overrides))
         _, params = load_released(a.released, a.compute_dtype)
         params = jax.device_put(params, trainer.repl)

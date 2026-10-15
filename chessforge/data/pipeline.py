@@ -1,4 +1,5 @@
 """Grain input pipelines (train: infinite shuffled; eval: finite, padded, multi-host safe)."""
+
 from __future__ import annotations
 
 import glob as globlib
@@ -21,8 +22,12 @@ def list_files(pattern: str) -> list[str]:
         return []
     if pattern.startswith("gs://"):
         star = pattern.find("*")
-        base = pattern[: pattern.rfind("/", 0, star)] if star >= 0 else os.path.dirname(pattern)
-        rest = pattern[len(base) + 1:]
+        base = (
+            pattern[: pattern.rfind("/", 0, star)]
+            if star >= 0
+            else os.path.dirname(pattern)
+        )
+        rest = pattern[len(base) + 1 :]
         return sorted(str(p) for p in epath.Path(base).glob(rest))
     return sorted(globlib.glob(pattern))
 
@@ -36,7 +41,7 @@ def stage_files(files: list[str], cache_dir: str) -> list[str]:
         if not f.startswith("gs://"):
             out.append(f)
             continue
-        local = os.path.join(cache_dir, f[len("gs://"):].replace("/", "__"))
+        local = os.path.join(cache_dir, f[len("gs://") :].replace("/", "__"))
         if not os.path.exists(local):
             tmp = local + ".tmp"
             with epath.Path(f).open("rb") as src, open(tmp, "wb") as dst:
@@ -46,7 +51,9 @@ def stage_files(files: list[str], cache_dir: str) -> list[str]:
     return out
 
 
-def empty_batch(batch_size: int, history: int, with_legal: bool = True) -> dict[str, np.ndarray]:
+def empty_batch(
+    batch_size: int, history: int, with_legal: bool = True
+) -> dict[str, np.ndarray]:
     out = {
         "board": np.zeros((batch_size, history, 64), np.int8),
         "time_info": np.zeros((batch_size, 3), np.float32),
@@ -66,7 +73,9 @@ def empty_batch(batch_size: int, history: int, with_legal: bool = True) -> dict[
 class FeaturizeTransform(pygrain.RandomMapTransform):
     """bytes -> dict of numpy arrays. Board one-hot happens on device (int8 over PCIe)."""
 
-    def __init__(self, history: int, history_mask_prob: float = 0.0, with_legal: bool = False):
+    def __init__(
+        self, history: int, history_mask_prob: float = 0.0, with_legal: bool = False
+    ):
         self.history = history
         self.history_mask_prob = history_mask_prob
         self.with_legal = with_legal
@@ -75,15 +84,23 @@ class FeaturizeTransform(pygrain.RandomMapTransform):
         rec, legal = records.decode_position(raw)
         stored = rec["boards"].shape[0]
         if self.history > stored:
-            raise ValueError(f"Model history {self.history} > stored history {stored}; re-run preprocessing")
-        boards = rec["boards"][stored - self.history:]
+            raise ValueError(
+                f"Model history {self.history} > stored history {stored}; re-run preprocessing"
+            )
+        boards = rec["boards"][stored - self.history :]
         n_hist = min(int(rec["n_hist"]), self.history - 1)
         if self.history_mask_prob > 0 and rng.random() < self.history_mask_prob:
             n_hist = int(rng.integers(0, n_hist + 1))
         rel = cu.to_relative_codes(boards, int(rec["stm"]), n_hist)
         self_elo, oppo_elo = float(rec["self_elo"]), float(rec["oppo_elo"])
-        time_info = np.array([rec["base_time"] / 100.0, rec["increment"] / 100.0, rec["clk_left"] / 100.0],
-                             dtype=np.float32)
+        time_info = np.array(
+            [
+                rec["base_time"] / 100.0,
+                rec["increment"] / 100.0,
+                rec["clk_left"] / 100.0,
+            ],
+            dtype=np.float32,
+        )
         out = {
             "board": rel.astype(np.int8),
             "time_info": time_info,
@@ -120,7 +137,9 @@ def _host_dataset(pattern: str, cache_dir: str):
     return ds
 
 
-def make_train_iterator(data_cfg, history: int, *, pattern: str | None = None, seed: int | None = None):
+def make_train_iterator(
+    data_cfg, history: int, *, pattern: str | None = None, seed: int | None = None
+):
     seed = data_cfg.shuffle_seed if seed is None else seed
     pcount, pidx = jax.process_count(), jax.process_index()
     assert data_cfg.global_batch_size % pcount == 0
@@ -128,13 +147,21 @@ def make_train_iterator(data_cfg, history: int, *, pattern: str | None = None, s
     ds = _host_dataset(pattern or data_cfg.train_glob, data_cfg.local_cache_dir)
     n_local = len(ds)
     ds = ds.shuffle(seed=seed + 7919 * pidx).repeat()
-    ds = ds.random_map(FeaturizeTransform(history, data_cfg.history_mask_prob, with_legal=True),
-                       seed=seed + 104729 * (pidx + 1))
-    it_ds = ds.to_iter_dataset(pygrain.ReadOptions(num_threads=data_cfg.read_threads,
-                                                   prefetch_buffer_size=data_cfg.prefetch_buffer_size))
+    ds = ds.random_map(
+        FeaturizeTransform(history, data_cfg.history_mask_prob, with_legal=True),
+        seed=seed + 104729 * (pidx + 1),
+    )
+    it_ds = ds.to_iter_dataset(
+        pygrain.ReadOptions(
+            num_threads=data_cfg.read_threads,
+            prefetch_buffer_size=data_cfg.prefetch_buffer_size,
+        )
+    )
     it_ds = it_ds.batch(per_host, drop_remainder=True)
     if data_cfg.num_workers > 0:
-        it_ds = it_ds.mp_prefetch(pygrain.MultiprocessingOptions(num_workers=data_cfg.num_workers))
+        it_ds = it_ds.mp_prefetch(
+            pygrain.MultiprocessingOptions(num_workers=data_cfg.num_workers)
+        )
     return iter(it_ds), n_local
 
 
@@ -150,8 +177,14 @@ def _pad(batch: dict, size: int) -> dict:
     return out
 
 
-def eval_batches(pattern: str, history: int, global_batch_size: int, cache_dir: str = "",
-                 max_batches: int | None = None, read_threads: int = 16):
+def eval_batches(
+    pattern: str,
+    history: int,
+    global_batch_size: int,
+    cache_dir: str = "",
+    max_batches: int | None = None,
+    read_threads: int = 16,
+):
     """Yields per-host batches; all hosts yield the same number (zero-weight padding)."""
     pcount = jax.process_count()
     per_host = global_batch_size // pcount
@@ -162,8 +195,15 @@ def eval_batches(pattern: str, history: int, global_batch_size: int, cache_dir: 
     n_batches = int(np.max(multihost_utils.process_allgather(np.array(n_batches))))
     if max_batches:
         n_batches = min(n_batches, max_batches)
-    it = iter(ds.to_iter_dataset(pygrain.ReadOptions(num_threads=read_threads, prefetch_buffer_size=64))
-              .batch(per_host, drop_remainder=False)) if n_local > 0 else iter(())
+    it = (
+        iter(
+            ds.to_iter_dataset(
+                pygrain.ReadOptions(num_threads=read_threads, prefetch_buffer_size=64)
+            ).batch(per_host, drop_remainder=False)
+        )
+        if n_local > 0
+        else iter(())
+    )
     empty = empty_batch(per_host, history, with_legal=True)
     for _ in range(n_batches):
         b = next(it, None)

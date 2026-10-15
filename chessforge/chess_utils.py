@@ -1,25 +1,32 @@
 """Chess encodings. Must stay byte-compatible with maia3/{utils,dataset}.py."""
+
 from __future__ import annotations
 
-import numpy as np
 import chess
+import numpy as np
 
 NUM_SQUARES = 64
 PROMO_PIECES = "qrbn"
 NUM_FROM_TO = 64 * 64
 NUM_PROMOTIONS = 8 * 8 * 4
-VOCAB_SIZE = NUM_FROM_TO + NUM_PROMOTIONS          # 4352
-NUM_VALUE_CLASSES = 3                               # [loss, draw, win] for side to move
+VOCAB_SIZE = NUM_FROM_TO + NUM_PROMOTIONS  # 4352
+NUM_VALUE_CLASSES = 3  # [loss, draw, win] for side to move
 LOSS, DRAW, WIN = 0, 1, 2
 
 # absolute piece codes: 0 empty, 1..6 white P N B R Q K, 7..12 black
 SWAP_COLOR = np.array([0, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6], dtype=np.int8)
-MIRROR_SQ = (np.arange(64) ^ 56).astype(np.int64)  # python-chess board.mirror() flips ranks
+MIRROR_SQ = (np.arange(64) ^ 56).astype(
+    np.int64
+)  # python-chess board.mirror() flips ranks
 
 
 def all_moves() -> list[str]:
     """Identical ordering to maia3.utils.get_all_possible_moves()."""
-    moves = [chess.square_name(f) + chess.square_name(t) for f in range(64) for t in range(64)]
+    moves = [
+        chess.square_name(f) + chess.square_name(t)
+        for f in range(64)
+        for t in range(64)
+    ]
     for ff in "abcdefgh":
         for tf in "abcdefgh":
             for p in PROMO_PIECES:
@@ -89,7 +96,7 @@ def to_relative_codes(codes: np.ndarray, stm: int, n_hist: int) -> np.ndarray:
     H = codes.shape[0]
     n_hist = int(min(n_hist, H - 1))
     lag = (H - 1) - np.arange(H)
-    black = ((int(stm) ^ (lag & 1)) == 1)
+    black = (int(stm) ^ (lag & 1)) == 1
     out = codes.copy()
     if black.any():
         out[black] = SWAP_COLOR[codes[black][:, MIRROR_SQ]]

@@ -1,4 +1,5 @@
 """Streaming Lichess PGN parsing, Maia-3 game filtering/balancing, position extraction."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -53,7 +54,7 @@ def open_pgn_stream(path: str, compressed: bool | None = None) -> io.TextIOBase:
     if compressed is None:
         compressed = path == "-" or path.endswith(".zst")
     if compressed:
-        raw = zstandard.ZstdDecompressor(max_window_size=2 ** 31).stream_reader(raw)
+        raw = zstandard.ZstdDecompressor(max_window_size=2**31).stream_reader(raw)
     return io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
 
 
@@ -86,7 +87,7 @@ def elo_bin(avg_elo: float) -> int:
 
 @dataclasses.dataclass
 class GameFilter:
-    game_type: str = "Blitz"       # case-sensitive Lichess Event marker
+    game_type: str = "Blitz"  # case-sensitive Lichess Event marker
     require_rated: bool = True
     exclude_bots: bool = True
     require_clock: bool = True
@@ -109,15 +110,25 @@ class GameFilter:
             int(inc)
         except (KeyError, ValueError):
             return False
-        if self.exclude_bots and "BOT" in (h.get("WhiteTitle", "").upper(), h.get("BlackTitle", "").upper()):
+        if self.exclude_bots and "BOT" in (
+            h.get("WhiteTitle", "").upper(),
+            h.get("BlackTitle", "").upper(),
+        ):
             return False
         if self.require_clock and "[%clk" not in movetext:
             return False
         return True
 
 
-def balanced_games(games: Iterable[tuple[dict, str]], filt: GameFilter, *, chunk_games: int = 20_000,
-                   per_bin: int = 10, chunk_counts: str = "raw", stats: dict | None = None):
+def balanced_games(
+    games: Iterable[tuple[dict, str]],
+    filt: GameFilter,
+    *,
+    chunk_games: int = 20_000,
+    per_bin: int = 10,
+    chunk_counts: str = "raw",
+    stats: dict | None = None,
+):
     """Maia-3 balancing (App. A.1): per chunk of `chunk_games` games, accept games into
     22 average-Elo bins until each bin has `per_bin` games or the chunk is consumed."""
     counts = [0] * NUM_ELO_BINS
@@ -144,7 +155,9 @@ def balanced_games(games: Iterable[tuple[dict, str]], filt: GameFilter, *, chunk
 
 def game_id(h: dict, movetext: str) -> str:
     site = h.get("Site", "")
-    return site.rsplit("/", 1)[-1] if site else hashlib.md5(movetext.encode()).hexdigest()
+    return (
+        site.rsplit("/", 1)[-1] if site else hashlib.md5(movetext.encode()).hexdigest()
+    )
 
 
 def stable_hash(s: str) -> int:
@@ -154,10 +167,12 @@ def stable_hash(s: str) -> int:
 @dataclasses.dataclass
 class PositionConfig:
     store_history: int = 8
-    positions_per_game: int = 32   # 0 => keep every eligible position
-    skip_first_plies: int = 0      # Maia-3 training keeps the opening; ALLIE eval drops 10
+    positions_per_game: int = 32  # 0 => keep every eligible position
+    skip_first_plies: int = 0  # Maia-3 training keeps the opening; ALLIE eval drops 10
     min_clock_seconds: float = 30.0
-    clock_check_on_comment: bool = True  # True: break as soon as [%clk] < min_clock_seconds
+    clock_check_on_comment: bool = (
+        True  # True: break as soon as [%clk] < min_clock_seconds
+    )
     max_ply: int = 100_000
     store_legal: bool = True
     seed: int = 0
@@ -230,20 +245,32 @@ def game_to_records(h: dict, movetext: str, cfg: PositionConfig) -> list[bytes]:
     for p in sorted(selected):
         lo = max(0, p - H + 1)
         window = np.zeros((H, 64), np.int8)
-        window[H - (p - lo + 1):] = codes_arr[lo:p + 1]
+        window[H - (p - lo + 1) :] = codes_arr[lo : p + 1]
         stm = p & 1
-        out.append(records.encode_position(
-            boards=window, n_hist=p - lo, stm=stm, move=move_idx[p],
-            self_elo=elos[stm], oppo_elo=elos[1 - stm],
-            value=cu.value_label(result, white_to_move=(stm == 0)),
-            ply=p, clk_left=clk_lefts[p], ponder=ponders[p],
-            base_time=base, increment=inc, legal=legal_at.get(p)))
+        out.append(
+            records.encode_position(
+                boards=window,
+                n_hist=p - lo,
+                stm=stm,
+                move=move_idx[p],
+                self_elo=elos[stm],
+                oppo_elo=elos[1 - stm],
+                value=cu.value_label(result, white_to_move=(stm == 0)),
+                ply=p,
+                clk_left=clk_lefts[p],
+                ponder=ponders[p],
+                base_time=base,
+                increment=inc,
+                legal=legal_at.get(p),
+            )
+        )
     return out
 
 
 class ShardedWriter:
     def __init__(self, out_dir: str, prefix: str, records_per_shard: int = 100_000):
         from array_record.python.array_record_module import ArrayRecordWriter
+
         self._cls = ArrayRecordWriter
         os.makedirs(out_dir, exist_ok=True)
         self.out_dir, self.prefix, self.rps = out_dir, prefix, records_per_shard
@@ -259,7 +286,9 @@ class ShardedWriter:
     def _rotate(self):
         if self._w is not None:
             self._w.close()
-        path = os.path.join(self.out_dir, f"{self.prefix}-{self._shard:05d}.array_record")
+        path = os.path.join(
+            self.out_dir, f"{self.prefix}-{self._shard:05d}.array_record"
+        )
         self._w = self._cls(path, "group_size:1")
         self._shard += 1
         self._n = 0

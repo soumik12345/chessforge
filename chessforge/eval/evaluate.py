@@ -1,12 +1,13 @@
 """Move-matching accuracy (legal-masked argmax), perplexity, per-rating-bin breakdown."""
+
 from __future__ import annotations
 
 import math
 
-from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 
 NUM_RATING_BINS = 32  # round(game_elo / 100), clipped
 
@@ -29,14 +30,28 @@ def make_eval_step(graphdef: nnx.GraphDef, data_sharding, repl):
         nll = jnp.where(w > 0, nll, 0.0)
         correct = (jnp.argmax(masked, -1) == batch["move"]).astype(jnp.float32) * w
         correct_unmasked = (jnp.argmax(lm, -1) == batch["move"]).astype(jnp.float32) * w
-        vnll = -jnp.take_along_axis(jax.nn.log_softmax(lv, -1), batch["value"][:, None], axis=1)[:, 0] * w
+        vnll = (
+            -jnp.take_along_axis(
+                jax.nn.log_softmax(lv, -1), batch["value"][:, None], axis=1
+            )[:, 0]
+            * w
+        )
         vacc = (jnp.argmax(lv, -1) == batch["value"]).astype(jnp.float32) * w
-        bins = jnp.clip(jnp.round(batch["game_elo"] / 100.0).astype(jnp.int32), 0, NUM_RATING_BINS - 1)
+        bins = jnp.clip(
+            jnp.round(batch["game_elo"] / 100.0).astype(jnp.int32),
+            0,
+            NUM_RATING_BINS - 1,
+        )
         oh = jax.nn.one_hot(bins, NUM_RATING_BINS) * w[:, None]
         return {
-            "n": w.sum(), "correct": correct.sum(), "correct_unmasked": correct_unmasked.sum(),
-            "nll": nll.sum(), "value_nll": vnll.sum(), "value_correct": vacc.sum(),
-            "bin_n": oh.sum(0), "bin_correct": (oh * correct[:, None]).sum(0),
+            "n": w.sum(),
+            "correct": correct.sum(),
+            "correct_unmasked": correct_unmasked.sum(),
+            "nll": nll.sum(),
+            "value_nll": vnll.sum(),
+            "value_correct": vacc.sum(),
+            "bin_n": oh.sum(0),
+            "bin_correct": (oh * correct[:, None]).sum(0),
             "bin_nll": (oh * nll[:, None]).sum(0),
         }
 
@@ -59,8 +74,11 @@ def summarize(s: dict) -> dict:
     for b in range(NUM_RATING_BINS):
         nb = float(s["bin_n"][b])
         if nb > 0:
-            per_bin[b * 100] = {"n": int(nb), "acc": float(s["bin_correct"][b]) / nb,
-                                "perplexity": math.exp(float(s["bin_nll"][b]) / nb)}
+            per_bin[b * 100] = {
+                "n": int(nb),
+                "acc": float(s["bin_correct"][b]) / nb,
+                "perplexity": math.exp(float(s["bin_nll"][b]) / nb),
+            }
     return {"overall": overall, "per_rating": per_bin}
 
 

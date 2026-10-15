@@ -1,4 +1,5 @@
 """Compact binary record for one training/eval position (ArrayRecord payload)."""
+
 from __future__ import annotations
 
 import functools
@@ -10,25 +11,41 @@ FORMAT_VERSION = 2
 
 @functools.lru_cache(maxsize=None)
 def position_dtype(history: int) -> np.dtype:
-    return np.dtype([
-        ("boards", np.int8, (history, 64)),  # absolute codes, oldest -> current
-        ("n_hist", np.int8),                 # real past boards available (<= history-1)
-        ("stm", np.int8),                    # 0 white / 1 black to move (current board)
-        ("move", np.int16),                  # target move index (side-to-move frame)
-        ("self_elo", np.int16),
-        ("oppo_elo", np.int16),
-        ("value", np.int8),                  # 0 loss, 1 draw, 2 win (side to move)
-        ("ply", np.int16),
-        ("clk_left", np.float32),            # seconds on clock before move
-        ("ponder", np.float32),              # seconds spent on the move (nan if unknown)
-        ("base_time", np.int16),
-        ("increment", np.int16),
-        ("n_legal", np.int16),
-    ])
+    return np.dtype(
+        [
+            ("boards", np.int8, (history, 64)),  # absolute codes, oldest -> current
+            ("n_hist", np.int8),  # real past boards available (<= history-1)
+            ("stm", np.int8),  # 0 white / 1 black to move (current board)
+            ("move", np.int16),  # target move index (side-to-move frame)
+            ("self_elo", np.int16),
+            ("oppo_elo", np.int16),
+            ("value", np.int8),  # 0 loss, 1 draw, 2 win (side to move)
+            ("ply", np.int16),
+            ("clk_left", np.float32),  # seconds on clock before move
+            ("ponder", np.float32),  # seconds spent on the move (nan if unknown)
+            ("base_time", np.int16),
+            ("increment", np.int16),
+            ("n_legal", np.int16),
+        ]
+    )
 
 
-def encode_position(*, boards, n_hist, stm, move, self_elo, oppo_elo, value, ply,
-                    clk_left=0.0, ponder=np.nan, base_time=0, increment=0, legal=None) -> bytes:
+def encode_position(
+    *,
+    boards,
+    n_hist,
+    stm,
+    move,
+    self_elo,
+    oppo_elo,
+    value,
+    ply,
+    clk_left=0.0,
+    ponder=np.nan,
+    base_time=0,
+    increment=0,
+    legal=None,
+) -> bytes:
     H = boards.shape[0]
     rec = np.zeros(1, position_dtype(H))
     rec["boards"][0] = boards

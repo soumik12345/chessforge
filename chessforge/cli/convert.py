@@ -1,4 +1,5 @@
 """Convert a released Maia-3 .pt to a serialized Flax msgpack."""
+
 import argparse
 
 from flax import nnx, serialization
@@ -10,6 +11,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     from ..models.convert_torch import load_released
+
     _, state = load_released(a.released)
     pure = nnx.to_pure_dict(state) if hasattr(nnx, "to_pure_dict") else state
     with open(a.out, "wb") as fh:

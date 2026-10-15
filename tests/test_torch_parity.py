@@ -1,4 +1,5 @@
 """Forward-pass parity of the Flax NNX model against maia3.models.MAIA3Model (fp32)."""
+
 from argparse import Namespace
 
 import jax.numpy as jnp
@@ -15,17 +16,30 @@ from chessforge.models.convert_torch import convert  # noqa: E402
 
 def torch_ns(c):
     return Namespace(
-        history=c.history, include_time_info=c.include_time_info, dim_emb=c.dim_emb, dim_vit=c.dim_vit,
-        num_blocks=c.num_blocks, num_heads=c.num_heads, mlp_ratio=c.mlp_ratio, dropout=0.0,
-        head_hid_dim=c.head_hid_dim, use_gab=c.pos_encoding == "gab",
-        use_relative_bias=c.pos_encoding == "relative", use_absolute_pe=c.pos_encoding == "absolute",
-        gab_gen_size=c.gab_gen_size, gab_per_square_dim=c.gab_per_square_dim,
-        gab_intermediate_dim=c.gab_intermediate_dim, use_rms_norm=c.use_rms_norm,
-        omit_qkv_biases=c.omit_qkv_biases, activation=c.activation,
+        history=c.history,
+        include_time_info=c.include_time_info,
+        dim_emb=c.dim_emb,
+        dim_vit=c.dim_vit,
+        num_blocks=c.num_blocks,
+        num_heads=c.num_heads,
+        mlp_ratio=c.mlp_ratio,
+        dropout=0.0,
+        head_hid_dim=c.head_hid_dim,
+        use_gab=c.pos_encoding == "gab",
+        use_relative_bias=c.pos_encoding == "relative",
+        use_absolute_pe=c.pos_encoding == "absolute",
+        gab_gen_size=c.gab_gen_size,
+        gab_per_square_dim=c.gab_per_square_dim,
+        gab_intermediate_dim=c.gab_intermediate_dim,
+        use_rms_norm=c.use_rms_norm,
+        omit_qkv_biases=c.omit_qkv_biases,
+        activation=c.activation,
     )
 
 
-@pytest.mark.parametrize("preset", ["maia3-5m", "maia3-23m", "maia3-5m-relative", "maia3-5m-absolute"])
+@pytest.mark.parametrize(
+    "preset", ["maia3-5m", "maia3-23m", "maia3-5m-relative", "maia3-5m-absolute"]
+)
 def test_parity_nnx(preset):
     c = build_model_config(preset, {"compute_dtype": "float32"})
     tm = MAIA3Model(torch_ns(c)).eval()
@@ -44,10 +58,19 @@ def test_parity_nnx(preset):
     boards = rng.integers(0, 13, size=(B, c.history, 64)).astype(np.int8)
     se = rng.integers(500, 2900, size=B)
     oe = rng.integers(500, 2900, size=B)
-    oh = (boards[..., None] == np.arange(1, 13)).astype(np.float32).transpose(0, 2, 1, 3).reshape(B, 64, -1)
-    tokens = np.concatenate([oh, np.zeros((B, 64, 1), np.float32)], -1)  # + clk_ponder column
+    oh = (
+        (boards[..., None] == np.arange(1, 13))
+        .astype(np.float32)
+        .transpose(0, 2, 1, 3)
+        .reshape(B, 64, -1)
+    )
+    tokens = np.concatenate(
+        [oh, np.zeros((B, 64, 1), np.float32)], -1
+    )  # + clk_ponder column
     with torch.no_grad():
-        tl, tv, tp = tm(torch.from_numpy(tokens), torch.from_numpy(se), torch.from_numpy(oe))
+        tl, tv, tp = tm(
+            torch.from_numpy(tokens), torch.from_numpy(se), torch.from_numpy(oe)
+        )
 
     jl, jv, jp = nnx_model(
         jnp.asarray(boards),

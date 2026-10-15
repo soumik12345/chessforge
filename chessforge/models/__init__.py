@@ -65,18 +65,15 @@ register_preset(
     gab_intermediate_dim=128,
 )
 register_preset(
-    "maia3-5m-absolute",
     **{**_PRESETS["maia3-5m"], "name": "maia3-5m-absolute", "pos_encoding": "absolute"},
 )
 register_preset(
-    "maia3-5m-relative",
     **{**_PRESETS["maia3-5m"], "name": "maia3-5m-relative", "pos_encoding": "relative"},
 )
 register_preset(
-    "maia3-5m-hist1", **{**_PRESETS["maia3-5m"], "name": "maia3-5m-hist1", "history": 1}
+    **{**_PRESETS["maia3-5m"], "name": "maia3-5m-hist1", "history": 1}
 )
 register_preset(
-    "maia3-5m-hist32",
     **{**_PRESETS["maia3-5m"], "name": "maia3-5m-hist32", "history": 32},
 )
 

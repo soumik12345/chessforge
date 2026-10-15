@@ -8,10 +8,15 @@ import os
 import shutil
 from typing import cast
 
-import grain.python as pygrain
 import jax
 import numpy as np
 from etils import epath
+from grain.python import (
+    ArrayRecordDataSource,
+    MapDataset,
+    MultiprocessingOptions,
+    ReadOptions,
+)
 from grain.sources import RandomAccessDataSource
 from jax.experimental import multihost_utils
 
@@ -134,8 +139,8 @@ def _host_dataset(pattern: str, cache_dir: str):
         files = files[pidx::pcount]
     files = stage_files(files, cache_dir)
     # ArrayRecord's untyped base class supplies the random-access methods.
-    source = cast(RandomAccessDataSource[bytes], pygrain.ArrayRecordDataSource(files))
-    ds = pygrain.MapDataset.source(source)
+    source = cast(RandomAccessDataSource[bytes], ArrayRecordDataSource(files))
+    ds = MapDataset.source(source)
     if not shard_by_file:
         ds = ds[pidx::pcount]
     return ds
@@ -156,7 +161,7 @@ def make_train_iterator(
         seed=seed + 104729 * (pidx + 1),
     )
     it_ds = ds.to_iter_dataset(
-        pygrain.ReadOptions(
+        ReadOptions(
             num_threads=data_cfg.read_threads,
             prefetch_buffer_size=data_cfg.prefetch_buffer_size,
         )
@@ -164,7 +169,7 @@ def make_train_iterator(
     it_ds = it_ds.batch(per_host, drop_remainder=True)
     if data_cfg.num_workers > 0:
         it_ds = it_ds.mp_prefetch(
-            pygrain.MultiprocessingOptions(num_workers=data_cfg.num_workers)
+            MultiprocessingOptions(num_workers=data_cfg.num_workers)
         )
     return iter(it_ds), n_local
 
@@ -202,7 +207,7 @@ def eval_batches(
     it = (
         iter(
             ds.to_iter_dataset(
-                pygrain.ReadOptions(num_threads=read_threads, prefetch_buffer_size=64)
+                ReadOptions(num_threads=read_threads, prefetch_buffer_size=64)
             ).batch(per_host, drop_remainder=False)
         )
         if n_local > 0

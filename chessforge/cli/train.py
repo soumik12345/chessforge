@@ -17,8 +17,8 @@ def main():
         jax.distributed.initialize()
     except Exception as e:  # noqa: BLE001  single-host / already initialized
         print(f"[info] jax.distributed.initialize skipped: {e}")
-    from ..config import load_train_config
-    from ..train.trainer import Trainer
+    from chessforge.config import load_train_config
+    from chessforge.train.trainer import Trainer
 
     Trainer(load_train_config(a.config, a.set)).fit()
 

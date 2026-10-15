@@ -1,11 +1,91 @@
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "chessforge"
-version = "0.1.0"
-requires-python = ">=3.10"
+dynamic = ["version"]
+description = "Training a fruit fly to do stuff"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "array-record>=0.4.1",
+    "etils[epath]>=1.14.0",
+    "flax>=0.10.7",
+    "grain>=0.2.18",
+    "huggingface-hub>=2.2.0",
+    "optax>=0.2.8",
+    "orbax-checkpoint>=0.12.7",
+    "python-chess>=1.999",
+    "pyyaml>=6.0.3",
+    "wandb>=0.30.0",
+    "zstandard>=0.25.0",
+]
 
-[tool.setuptools.packages.find]
-include = ["chessforge*"]
+[project.optional-dependencies]
+cpu = ["jax>=0.6.2"]
+cuda12 = ["jax[cuda12]>=0.8.0; sys_platform == 'linux'"]
+cuda13 = ["jax[cuda13]>=0.8.0; sys_platform == 'linux'"]
+tpu = ["jax[tpu]>=0.6.2; sys_platform == 'linux'"]
+
+[dependency-groups]
+dev = [
+    "uv>=0.4.20",
+    "pytest>=8.3.3",
+    "greenlet>=3.0.0",
+    "isort>=5.13.2",
+    "black>=24.10.0",
+    "ruff>=0.6.9",
+]
+docs = [
+    "mkdocs>=1.6.1",
+    "mkdocstrings>=0.26.1",
+    "mkdocstrings-python>=1.11.1",
+    "mkdocs-material>=9.5.39",
+    "mkdocs-minify-plugin>=0.8.0",
+    "mkdocs-glightbox>=0.4.0",
+    "mkdocs-jupyter>=0.25.0",
+    "mkdocs-panzoom-plugin",
+    "jupyter>=1.1.1",
+]
+build = [
+    "twine>=5.1.1",
+    "wheel>=0.40",
+    "build>=0.10",
+    "pyinstaller>=6.0",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chessforge"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["I", "F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["chessforge"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.uv]
+# Native scientific dependencies do not support WebAssembly targets.
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'darwin'",
+    "sys_platform == 'win32'",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

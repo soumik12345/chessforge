@@ -17,8 +17,15 @@ def main():
         jax.distributed.initialize()
     except Exception as e:  # noqa: BLE001  single-host / already initialized
         print(f"[info] jax.distributed.initialize skipped: {e}")
+    from absl import flags
+
     from chessforge.config import load_train_config
     from chessforge.train.trainer import Trainer
+
+    # This is a known issue: argparse vs abseil when working with grain
+    # Without this, training fails
+    if not flags.FLAGS.is_parsed():
+        flags.FLAGS(["chessforge-train"])
 
     Trainer(load_train_config(a.config, a.set)).fit()
 

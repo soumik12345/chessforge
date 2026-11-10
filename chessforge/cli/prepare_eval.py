@@ -40,6 +40,12 @@ def main():
     ap.add_argument("--name", default="eval")
     ap.add_argument("--skip_first_plies", type=int, default=10)
     ap.add_argument("--min_clock", type=float, default=30.0)
+    ap.add_argument(
+        "--clock_check_on_comment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also drop the move where the post-move [%clk] comment first falls below min_clock",
+    )
     ap.add_argument("--store_history", type=int, default=8)
     ap.add_argument(
         "--filter_game_type", default="", help="e.g. Blitz to apply rated-blitz filter"
@@ -65,6 +71,7 @@ def main():
         positions_per_game=0,
         skip_first_plies=a.skip_first_plies,
         min_clock_seconds=a.min_clock,
+        clock_check_on_comment=a.clock_check_on_comment,
         store_legal=True,
     )
     filt = pgn.GameFilter(game_type=a.filter_game_type) if a.filter_game_type else None

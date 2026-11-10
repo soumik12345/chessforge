@@ -86,7 +86,7 @@ class TrainConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     value_coef: float = 0.1
     ponder_coef: float = 0.0
-    mask_illegal_in_loss: bool = False
+    mask_illegal_in_loss: bool = True
     seed: int = 42
     workdir: str = "/tmp/maia3_run"
     log_every: int = 100

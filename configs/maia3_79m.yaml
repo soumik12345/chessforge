@@ -16,3 +16,4 @@ optim:
   cosine_cycle_steps: 50000
   total_steps: 1000000
 value_coef: 0.1
+mask_illegal_in_loss: true

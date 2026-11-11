@@ -1,0 +1,30 @@
+model: chessforge-v2-28m
+model_overrides:
+  compute_dtype: bfloat16
+  remat_blocks: true          # fits BS=1024-2048 on a single 16GB v5e-1 or GPU; set false on v6e-1/8xGPU
+workdir: /tmp/chessforge_runs/master_28m
+data:
+  train_glob: /mnt/maia3data/mix_1800plus_titled_otb/*/train/*.array_record
+  anneal_glob: /mnt/maia3data/pure_titled_and_otb/*/train/*.array_record
+  anneal_start_frac: 0.80
+  val_glob: /mnt/maia3data/pure_titled_and_otb/*/val/*.array_record
+  test_glob: /mnt/maia3data/eval_titled_antisf/*.array_record
+  local_cache_dir: /tmp/chessforge_shard_cache
+  global_batch_size: 2048
+  eval_batch_size: 2048
+  history_mask_prob: 0.05
+optim:
+  schedule: wsd
+  decay_frac: 0.20
+  lr: 4.0e-4
+  min_lr: 2.0e-6
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  warmup_steps: 2000
+  total_steps: 250000
+  grad_accum_steps: 2         # microbatch=1024 on v5e-1/v6e-1, or 128/GPU on 8xGPU
+value_coef: 0.10
+ponder_coef: 0.05
+reply_coef: 0.15
+label_smoothing: 0.01
+mask_illegal_in_loss: true

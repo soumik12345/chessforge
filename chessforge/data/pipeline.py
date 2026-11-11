@@ -1,4 +1,4 @@
-"""High-throughput input pipelines (train: sequential C++ shard reader + RAM shuffle pool; eval: Grain)."""
+"""High-throughput input pipelines supporting both FORMAT_VERSION 2 and 3 shards."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from jax.experimental import multihost_utils
 from .. import chess_utils as cu
 from . import records
 
-# Maximum number of legal moves in any reachable chess position is 218; 224 aligns to 32B.
 MAX_LEGAL_MOVES = 224
 
 
@@ -57,6 +56,46 @@ def stage_files(files: list[str], cache_dir: str) -> list[str]:
     return out
 
 
+def _build_rich_time_and_meta(
+    base_s: np.ndarray,
+    inc_s: np.ndarray,
+    clk_left: np.ndarray,
+    opp_clk_left: np.ndarray,
+    prev_opp_ponder: np.ndarray,
+    has_clock: np.ndarray,
+    stm: np.ndarray,
+    castling: np.ndarray,
+    ep_file: np.ndarray,
+    rep_count: np.ndarray,
+):
+    l_base = np.log1p(np.maximum(base_s, 0.0)) / 8.0
+    l_inc = np.log1p(np.maximum(inc_s, 0.0)) / 4.0
+    l_self = np.log1p(np.maximum(clk_left, 0.0)) / 8.0
+    l_opp = np.log1p(np.maximum(opp_clk_left, 0.0)) / 8.0
+    prev_p = np.where(np.isfinite(prev_opp_ponder), np.maximum(prev_opp_ponder, 0.0), 0.0)
+    l_prev = np.log1p(prev_p) / 5.0
+    rich_time = np.stack(
+        [l_base, l_inc, l_self, l_opp, (l_self - l_opp) * 2.0, l_prev], axis=-1
+    ).astype(np.float32)
+    rich_time = rich_time * has_clock[:, None]
+
+    board_meta = np.stack(
+        [
+            stm.astype(np.float32),
+            ((castling & 1) != 0).astype(np.float32),
+            ((castling & 2) != 0).astype(np.float32),
+            ((castling & 4) != 0).astype(np.float32),
+            ((castling & 8) != 0).astype(np.float32),
+            (ep_file >= 0).astype(np.float32),
+            (rep_count >= 1).astype(np.float32),
+            (rep_count >= 2).astype(np.float32),
+        ],
+        axis=-1,
+    )
+    ep_sq = np.where(ep_file >= 0, 40 + ep_file.astype(np.int32), -1).astype(np.int32)
+    return rich_time, board_meta, ep_sq
+
+
 def featurize_records_batch(
     rec: np.ndarray,
     legal_idx: np.ndarray,
@@ -65,10 +104,10 @@ def featurize_records_batch(
     history_mask_prob: float,
     rng: np.random.Generator,
 ) -> dict[str, np.ndarray]:
-    """Vectorized featurization over a (B,) structured array of position_dtype."""
+    """Vectorized featurization over a (B,) structured array of v3 position_dtype."""
     B = rec.shape[0]
     H = history
-    boards = rec["boards"][:, stored_history - H :]  # (B, H, 64)
+    boards = rec["boards"][:, stored_history - H :]
     n_hist = np.minimum(rec["n_hist"].astype(np.int32), H - 1)
     if history_mask_prob > 0:
         mask_draw = rng.random(B) < history_mask_prob
@@ -88,13 +127,24 @@ def featurize_records_batch(
 
     self_elo = rec["self_elo"].astype(np.float32)
     oppo_elo = rec["oppo_elo"].astype(np.float32)
-    time_info = np.stack(
-        [
-            rec["base_time"].astype(np.float32) / 100.0,
-            rec["increment"].astype(np.float32) / 100.0,
-            rec["clk_left"].astype(np.float32) / 100.0,
-        ],
-        axis=-1,
+    base_s = rec["base_time"].astype(np.float32)
+    inc_s = rec["increment"].astype(np.float32)
+    clk_left = rec["clk_left"].astype(np.float32)
+    opp_clk_left = rec["opp_clk_left"].astype(np.float32)
+    has_clock = rec["has_clock"].astype(np.float32)
+
+    time_info = np.stack([base_s / 100.0, inc_s / 100.0, clk_left / 100.0], axis=-1)
+    rich_time, board_meta, ep_sq = _build_rich_time_and_meta(
+        base_s,
+        inc_s,
+        clk_left,
+        opp_clk_left,
+        rec["prev_opp_ponder"].astype(np.float32),
+        has_clock,
+        stm,
+        rec["castling"].astype(np.uint8),
+        rec["ep_file"].astype(np.int32),
+        rec["rep_count"].astype(np.int32),
     )
 
     legal = np.zeros((B, cu.VOCAB_SIZE), dtype=np.bool_)
@@ -106,12 +156,23 @@ def featurize_records_batch(
     return {
         "board": rel.astype(np.int8),
         "time_info": time_info,
+        "rich_time": rich_time,
+        "has_clock": has_clock,
+        "board_meta": board_meta,
+        "ep_square_idx": ep_sq,
+        "self_title": rec["self_title"].astype(np.int32),
+        "oppo_title": rec["oppo_title"].astype(np.int32),
+        "game_format": rec["game_format"].astype(np.int32),
         "self_elo": self_elo,
         "oppo_elo": oppo_elo,
         "game_elo": (self_elo + oppo_elo) * np.float32(0.5),
         "move": rec["move"].astype(np.int32),
+        "next_move": rec["next_move"].astype(np.int32),
+        "sf_move": rec["sf_move"].astype(np.int32),
+        "sf_cp_loss": rec["sf_cp_loss"].astype(np.float32),
         "value": rec["value"].astype(np.int32),
         "ponder": rec["ponder"].astype(np.float32),
+        "clk_left": clk_left,
         "weight": np.ones((B,), dtype=np.float32),
         "legal": legal,
     }
@@ -139,7 +200,7 @@ class FastShardIterator:
         self.stored_history = history
         self.history_mask_prob = history_mask_prob
         self.seed = seed
-        self.dt = records.position_dtype(self.history)
+        self.dt = records.position_dtype(self.history, records.FORMAT_VERSION)
 
         self._lock = threading.Lock()
         self.epoch = 0
@@ -204,20 +265,22 @@ class FastShardIterator:
         finally:
             r.close()
 
-        if recs[0][0] != records.FORMAT_VERSION:
-            raise ValueError(f"Unsupported record version {recs[0][0]} in {path}")
+        ver = int(recs[0][0])
+        if ver not in (records.LEGACY_FORMAT_VERSION, records.FORMAT_VERSION):
+            raise ValueError(f"Unsupported record version {ver} in {path}")
         shard_h = int(recs[0][1])
         if shard_h < self.history:
             raise ValueError(
                 f"Model history {self.history} > shard stored history {shard_h} in {path}"
             )
-        shard_dt = records.position_dtype(shard_h)
-        nbytes = shard_dt.itemsize
+        raw_dt = records.position_dtype(shard_h, ver)
+        nbytes = raw_dt.itemsize
 
         buf = b"".join(raw[2 : 2 + nbytes] for raw in recs)
-        arr = np.frombuffer(buf, dtype=shard_dt).copy()
+        arr = np.frombuffer(buf, dtype=raw_dt).copy()
+        if ver == records.LEGACY_FORMAT_VERSION:
+            arr = records.upgrade_v2_to_v3(arr, shard_h)
 
-        # Unpack trailing variable-length int16 legal move indices in pure vectorized NumPy
         legal_raw = b"".join(raw[2 + nbytes :] for raw in recs)
         legal_buf = np.frombuffer(legal_raw, dtype=np.int16)
         raw_counts = arr["n_legal"].astype(np.int32)
@@ -311,13 +374,11 @@ class FastShardIterator:
     def set_state(self, state: dict):
         with self._lock:
             self.epoch = int(state.get("epoch", 0))
-            # Step back by buffer_shards so active pool shards are reconstructed at the saved position
             saved_idx = int(state.get("file_idx", 0))
             self.file_idx = max(0, saved_idx - self.buffer_shards)
             self._shuffle_files_locked()
             reload_paths = [self._next_path_locked() for _ in range(self.buffer_shards)]
 
-        # Drain any stale Epoch-0 shards queued by the background worker before set_state
         while True:
             try:
                 self._q.get_nowait()
@@ -342,12 +403,23 @@ def empty_batch(
     out = {
         "board": np.zeros((batch_size, history, 64), np.int8),
         "time_info": np.zeros((batch_size, 3), np.float32),
+        "rich_time": np.zeros((batch_size, 6), np.float32),
+        "has_clock": np.zeros((batch_size,), np.float32),
+        "board_meta": np.zeros((batch_size, 8), np.float32),
+        "ep_square_idx": np.full((batch_size,), -1, np.int32),
+        "self_title": np.zeros((batch_size,), np.int32),
+        "oppo_title": np.zeros((batch_size,), np.int32),
+        "game_format": np.zeros((batch_size,), np.int32),
         "self_elo": np.zeros((batch_size,), np.float32),
         "oppo_elo": np.zeros((batch_size,), np.float32),
         "game_elo": np.zeros((batch_size,), np.float32),
         "move": np.zeros((batch_size,), np.int32),
+        "next_move": np.full((batch_size,), -1, np.int32),
+        "sf_move": np.full((batch_size,), -1, np.int32),
+        "sf_cp_loss": np.full((batch_size,), -1.0, np.float32),
         "value": np.zeros((batch_size,), np.int32),
         "ponder": np.zeros((batch_size,), np.float32),
+        "clk_left": np.zeros((batch_size,), np.float32),
         "weight": np.zeros((batch_size,), np.float32),
     }
     if with_legal:
@@ -356,7 +428,7 @@ def empty_batch(
 
 
 class FeaturizeTransform(pygrain.RandomMapTransform):
-    """bytes -> dict of numpy arrays (used for eval)."""
+    """bytes -> dict of numpy arrays (used for Grain eval)."""
 
     def __init__(
         self, history: int, history_mask_prob: float = 0.0, with_legal: bool = False
@@ -378,23 +450,46 @@ class FeaturizeTransform(pygrain.RandomMapTransform):
             n_hist = int(rng.integers(0, n_hist + 1))
         rel = cu.to_relative_codes(boards, int(rec["stm"]), n_hist)
         self_elo, oppo_elo = float(rec["self_elo"]), float(rec["oppo_elo"])
-        time_info = np.array(
-            [
-                rec["base_time"] / 100.0,
-                rec["increment"] / 100.0,
-                rec["clk_left"] / 100.0,
-            ],
-            dtype=np.float32,
+        base_s = float(rec["base_time"])
+        inc_s = float(rec["increment"])
+        clk_left = float(rec["clk_left"])
+        opp_clk_left = float(rec["opp_clk_left"])
+        has_clock = float(rec["has_clock"])
+
+        rich_time, board_meta, ep_sq = _build_rich_time_and_meta(
+            np.asarray([base_s], np.float32),
+            np.asarray([inc_s], np.float32),
+            np.asarray([clk_left], np.float32),
+            np.asarray([opp_clk_left], np.float32),
+            np.asarray([rec["prev_opp_ponder"]], np.float32),
+            np.asarray([has_clock], np.float32),
+            np.asarray([rec["stm"]], np.int32),
+            np.asarray([rec["castling"]], np.uint8),
+            np.asarray([rec["ep_file"]], np.int32),
+            np.asarray([rec["rep_count"]], np.int32),
         )
         out = {
             "board": rel.astype(np.int8),
-            "time_info": time_info,
+            "time_info": np.array(
+                [base_s / 100.0, inc_s / 100.0, clk_left / 100.0], dtype=np.float32
+            ),
+            "rich_time": rich_time[0],
+            "has_clock": np.float32(has_clock),
+            "board_meta": board_meta[0],
+            "ep_square_idx": np.int32(ep_sq[0]),
+            "self_title": np.int32(rec["self_title"]),
+            "oppo_title": np.int32(rec["oppo_title"]),
+            "game_format": np.int32(rec["game_format"]),
             "self_elo": np.float32(self_elo),
             "oppo_elo": np.float32(oppo_elo),
-            "game_elo": np.float32((self_elo + oppo_elo) / 2),
+            "game_elo": np.float32((self_elo + oppo_elo) * 0.5),
             "move": np.int32(rec["move"]),
+            "next_move": np.int32(rec["next_move"]),
+            "sf_move": np.int32(rec["sf_move"]),
+            "sf_cp_loss": np.float32(rec["sf_cp_loss"]),
             "value": np.int32(rec["value"]),
             "ponder": np.float32(rec["ponder"]),
+            "clk_left": np.float32(clk_left),
             "weight": np.float32(1.0),
         }
         if self.with_legal:
@@ -455,9 +550,16 @@ def _pad(batch: dict, size: int) -> dict:
     n = batch["weight"].shape[0]
     if n == size:
         return batch
+    pad_defaults = {
+        "legal": True,
+        "ep_square_idx": -1,
+        "next_move": -1,
+        "sf_move": -1,
+        "sf_cp_loss": -1.0,
+    }
     out = {}
     for k, v in batch.items():
-        pad_val = True if k == "legal" else 0
+        pad_val = pad_defaults.get(k, 0)
         pad = np.full((size - n,) + v.shape[1:], pad_val, dtype=v.dtype)
         out[k] = np.concatenate([v, pad], 0)
     return out
@@ -471,7 +573,6 @@ def eval_batches(
     max_batches: int | None = None,
     read_threads: int = 16,
 ):
-    """Yields per-host batches; all hosts yield the same number (zero-weight padding)."""
     pcount = jax.process_count()
     per_host = global_batch_size // pcount
     ds = _host_dataset(pattern, cache_dir)

@@ -1,0 +1,30 @@
+model: chessforge-v2-28m
+model_overrides:
+  compute_dtype: bfloat16
+  remat_blocks: true
+init_from_checkpoint: /tmp/chessforge_runs/master_28m/checkpoints
+workdir: /tmp/chessforge_runs/master_28m_anti_engine_dpo
+data:
+  train_glob: /mnt/maia3data/dpo_titled_antisf/train/*.array_record
+  val_glob: /mnt/maia3data/dpo_titled_antisf/val/*.array_record
+  test_glob: /mnt/maia3data/eval_titled_antisf/*.array_record
+  local_cache_dir: /tmp/chessforge_shard_cache
+  global_batch_size: 1024
+  eval_batch_size: 1024
+  history_mask_prob: 0.0
+optim:
+  schedule: cosine
+  lr: 3.0e-5
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  warmup_steps: 250
+  total_steps: 8000
+  grad_accum_steps: 2
+value_coef: 0.10
+ponder_coef: 0.05
+reply_coef: 0.10
+dpo_coef: 0.30
+dpo_beta: 0.20
+sf_max_cp_loss: 35.0
+mask_illegal_in_loss: true

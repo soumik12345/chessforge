@@ -1,8 +1,4 @@
-"""Evaluate either a released Maia-3 checkpoint (validation of this codebase) or our own run.
-
-python -m chessforge.cli.eval --released maia3-5m --test_glob '/data/allie_test/*.array_record'
-python -m chessforge.cli.eval --config configs/maia3_5m.yaml
-"""
+"""Evaluate a released Maia-3 checkpoint or a Chessforge v1/v2 checkpoint."""
 
 import argparse
 import json
@@ -20,14 +16,18 @@ def main():
     ap.add_argument("--out")
     a = ap.parse_args()
 
-    import jax
+    from chessforge.distributed import init_distributed
 
-    try:
-        jax.distributed.initialize()
-    except Exception:  # noqa: BLE001
-        pass
+    init_distributed()
+
+    import jax
+    from absl import flags
+
     from ..config import load_train_config
     from ..train.trainer import Trainer
+
+    if not flags.FLAGS.is_parsed():
+        flags.FLAGS(["chessforge-eval"])
 
     overrides = list(a.set) + [f"data.eval_batch_size={a.batch_size}"]
     if a.test_glob:

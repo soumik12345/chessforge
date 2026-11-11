@@ -1,8 +1,4 @@
-"""PGN games -> eval positions with legal-move masks (ALLIE test set or reconstructions).
-
-ALLIE protocol: drop first 10 (ply), truncate after first time a player has < 30 s.
-Sanity check: the ALLIE test set should produce 884,049 positions.
-"""
+"""PGN games -> eval shards with legal masks (supports ALLIE, Titled Online, and OTB)."""
 
 from __future__ import annotations
 
@@ -44,24 +40,20 @@ def main():
         "--clock_check_on_comment",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Also drop the move where the post-move [%clk] comment first falls below min_clock",
     )
+    ap.add_argument("--allow_no_clock", action="store_true")
+    ap.add_argument("--allow_unrated", action="store_true")
     ap.add_argument("--store_history", type=int, default=8)
+    ap.add_argument("--filter_game_type", default="")
+    ap.add_argument("--min_elo", type=int, default=0)
     ap.add_argument(
-        "--filter_game_type", default="", help="e.g. Blitz to apply rated-blitz filter"
+        "--titled_mode", choices=["none", "any", "both", "above_elo"], default="none"
     )
-    ap.add_argument(
-        "--sample_prob", type=float, default=1.0, help="reconstruct: keep games w.p."
-    )
+    ap.add_argument("--titled_elo_threshold", type=int, default=2350)
+    ap.add_argument("--sample_prob", type=float, default=1.0)
     ap.add_argument("--max_games", type=int, default=0)
-    ap.add_argument(
-        "--per_rating_bucket_cap", type=int, default=0, help="ALLIE-augmented style cap"
-    )
-    ap.add_argument(
-        "--only_buckets",
-        default="",
-        help="comma list of rounded ratings, e.g. 600,700,2800",
-    )
+    ap.add_argument("--per_rating_bucket_cap", type=int, default=0)
+    ap.add_argument("--only_buckets", default="")
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 2))
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -72,9 +64,24 @@ def main():
         skip_first_plies=a.skip_first_plies,
         min_clock_seconds=a.min_clock,
         clock_check_on_comment=a.clock_check_on_comment,
+        allow_no_clock=a.allow_no_clock,
         store_legal=True,
     )
-    filt = pgn.GameFilter(game_type=a.filter_game_type) if a.filter_game_type else None
+    use_filter = bool(
+        a.filter_game_type or a.titled_mode != "none" or a.min_elo > 0
+    )
+    filt = (
+        pgn.GameFilter(
+            game_type=a.filter_game_type,
+            require_rated=not a.allow_unrated,
+            require_clock=not a.allow_no_clock,
+            min_elo=a.min_elo,
+            titled_mode=a.titled_mode,
+            titled_elo_threshold=a.titled_elo_threshold,
+        )
+        if use_filter
+        else None
+    )
     only = {int(x) for x in a.only_buckets.split(",") if x}
     rng = np.random.default_rng(a.seed)
     caps: dict[int, int] = {}
@@ -84,7 +91,9 @@ def main():
         for h, mt in pgn.iter_games(pgn.open_pgn_stream(a.input)):
             if filt is not None and not filt(h, mt):
                 continue
-            if "TimeControl" not in h or "+" not in h["TimeControl"]:
+            if not a.allow_no_clock and (
+                "TimeControl" not in h or "+" not in h["TimeControl"]
+            ):
                 continue
             try:
                 bucket = (

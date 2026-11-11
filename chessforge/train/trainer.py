@@ -27,6 +27,9 @@ class TrainState:
     params: Any
     opt_state: Any
 
+    def __repr__(self) -> str:
+        return f"TrainState(step={int(self.step)})"
+
 
 def make_optimizer(o, schedule):
     return optax.chain(

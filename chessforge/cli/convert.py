@@ -10,7 +10,7 @@ def main():
     ap.add_argument("--released", required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    from ..models.convert_torch import load_released
+    from chessforge.models.convert_torch import load_released
 
     _, state = load_released(a.released)
     pure = nnx.to_pure_dict(state) if hasattr(nnx, "to_pure_dict") else state

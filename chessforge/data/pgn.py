@@ -13,7 +13,7 @@ from typing import Iterable, Iterator
 import chess
 import numpy as np
 import zstandard
-from array_record.python.array_record_module import ArrayRecordWriter
+from array_record.python.array_record_module import ArrayRecordWriter  # ty: ignore[import-not-found]
 
 from chessforge import chess_utils as cu
 from chessforge.data import records
@@ -172,7 +172,7 @@ class PositionConfig:
     skip_first_plies: int = 0  # Maia-3 training keeps the opening; ALLIE eval drops 10
     min_clock_seconds: float = 30.0
     clock_check_on_comment: bool = (
-        True  # True: break as soon as [%clk] < min_clock_seconds
+        False  # False: check clock before the move (min(clocks) < min_clock_seconds)
     )
     max_ply: int = 100_000
     store_legal: bool = True

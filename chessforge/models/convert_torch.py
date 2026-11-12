@@ -155,7 +155,7 @@ def load_released(
     """Download + convert a released Maia-3 checkpoint. Returns (ModelConfig, nnx.State)."""
     from huggingface_hub import hf_hub_download
 
-    from . import HF_CHECKPOINTS, build_model_config
+    from chessforge.models import HF_CHECKPOINTS, build_model_config
 
     repo, fname = HF_CHECKPOINTS[preset]
     c = build_model_config(preset, {"compute_dtype": compute_dtype})

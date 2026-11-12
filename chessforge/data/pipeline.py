@@ -18,8 +18,8 @@ from etils import epath
 from grain.sources import RandomAccessDataSource
 from jax.experimental import multihost_utils
 
-from .. import chess_utils as cu
-from . import records
+from chessforge import chess_utils as cu
+from chessforge.data import records
 
 # Maximum number of legal moves in any reachable chess position is 218; 224 aligns to 32B.
 MAX_LEGAL_MOVES = 224

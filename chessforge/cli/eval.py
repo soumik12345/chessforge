@@ -26,14 +26,14 @@ def main():
         jax.distributed.initialize()
     except Exception:  # noqa: BLE001
         pass
-    from ..config import load_train_config
-    from ..train.trainer import Trainer
+    from chessforge.config import load_train_config
+    from chessforge.train.trainer import Trainer
 
     overrides = list(a.set) + [f"data.eval_batch_size={a.batch_size}"]
     if a.test_glob:
         overrides.append(f"data.test_glob={a.test_glob}")
     if a.released:
-        from ..models.convert_torch import load_released
+        from chessforge.models.convert_torch import load_released
 
         overrides += [
             f"model={a.released}",

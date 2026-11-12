@@ -1,4 +1,4 @@
-"""ChessformerV2: Deep Pre-Norm + Ray-GAB + Global Registers + Official-Title AdaLN."""
+"""ChessformerV2: Deep Pre-Norm + Zero-Copy Ray-GAB + Cross-Attn Pool + Official-Title AdaLN."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from chessforge.models.chessformer import (
 )
 
 RMS_EPS = float(np.finfo(np.float32).eps)
+ADALN_BOTTLENECK = 128
 
 
 def rms_norm(features: int, c: ModelConfig, *, rngs: nnx.Rngs) -> nnx.RMSNorm:
@@ -59,10 +60,10 @@ class ContextConditioner(nnx.Module):
             param_dtype=cfg.pdtype,
             rngs=rngs,
         )
-        # 2 * elo_num_basis + 3 scalar skill + 2*tdim (self/opp title) + tdim (format) + 8 meta + 7 clock
         in_dim = 2 * cfg.elo_num_basis + 3 + 3 * tdim + 8 + 7
         self.fc1 = torch_linear(in_dim, D, cfg, rngs=rngs)
         self.fc2 = torch_linear(D, D, cfg, rngs=rngs)
+        self.adaln_bottleneck = torch_linear(D, ADALN_BOTTLENECK, cfg, rngs=rngs)
 
     def _rbf_elo(self, elo: jax.Array) -> jax.Array:
         K = self.cfg.elo_num_basis
@@ -81,7 +82,7 @@ class ContextConditioner(nnx.Module):
         board_meta: jax.Array,
         rich_time: jax.Array,
         has_clock: jax.Array,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, jax.Array]:
         cdt = self.cfg.dtype
         se_rbf = self._rbf_elo(self_elo)
         oe_rbf = self._rbf_elo(oppo_elo)
@@ -110,18 +111,19 @@ class ContextConditioner(nnx.Module):
             ],
             axis=-1,
         )
-        h = jax.nn.silu(self.fc1(feat))
-        return self.fc2(h).astype(jnp.float32)
+        cond = self.fc2(jax.nn.silu(self.fc1(feat))).astype(jnp.float32)
+        cond_low = jax.nn.silu(self.adaln_bottleneck(cond))  # (B, 128) in cdt
+        return cond, cond_low
 
 
 class RayGABBias(nnx.Module):
-    """Combines learned GAB with exact line-of-sight (0 blockers) & pin/X-ray (1 blocker) rays."""
+    """Learned spatial GAB + zero-copy exact line-of-sight & pin/X-ray bias on (B, H, 64, 64)."""
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.gab = GABGenerator(cfg, rngs=rngs)
         if cfg.use_ray_gab:
-            self.ray_proj = torch_linear(8, cfg.num_heads, cfg, rngs=rngs, use_bias=False)
+            self.ray_w = nnx.Param(jnp.zeros((8, cfg.num_heads), dtype=cfg.pdtype))
             self.rel_table = nnx.Param(
                 jnp.zeros((cu.NUM_PAIR_RELATIONS, cfg.num_heads), dtype=cfg.pdtype)
             )
@@ -131,13 +133,17 @@ class RayGABBias(nnx.Module):
     ) -> jax.Array:
         bias = self.gab(x_sq, gab_weight)  # (B, H, 64, 64)
         if self.cfg.use_ray_gab and ray_feats is not None:
-            # ray_feats: (B, 64, 64, 8) -> project to (B, H, 64, 64)
-            rb = self.ray_proj(ray_feats).astype(jnp.float32).transpose(0, 3, 1, 2)
-            rel_idx = jnp.asarray(cu.PAIR_REL_INDEX)
-            static_b = self.rel_table.value[rel_idx].astype(jnp.float32).transpose(
-                2, 0, 1
+            # ray_feats is already (B, 8, 64, 64) in compute_dtype -> zero transpose copies!
+            rb = jnp.einsum(
+                "bcij,ch->bhij",
+                ray_feats,
+                self.ray_w.value.astype(self.cfg.dtype),
+                preferred_element_type=jnp.float32,
             )
-            bias = bias + rb + static_b[None, :, :, :]
+            static_b = self.rel_table.value[jnp.asarray(cu.PAIR_REL_INDEX)].astype(
+                jnp.float32
+            ).transpose(2, 0, 1)
+            bias = bias + rb + static_b[None]
         return bias
 
 
@@ -196,39 +202,48 @@ class MultiHeadAttentionV2(nnx.Module):
         w = jax.nn.softmax(logits, axis=-1)
         w = _dropout(w, c.dropout, deterministic, rng)
         out = jnp.einsum("bhqk,bkhd->bqhd", w.astype(c.dtype), v).reshape(B, S, D)
-        return self.out(out), logits[:, :, :64, :64]
+        return self.out(out), logits
 
 
 class SwiGLUMLP(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         D = cfg.dim_vit
-        raw_h = int(D * cfg.mlp_ratio * 2.0 / 3.0) if cfg.mlp_ratio <= 3.0 else int(D * cfg.mlp_ratio)
-        hidden = ((max(raw_h, 64) + 63) // 64) * 64  # align to 64 for MXU / TensorCores
-        self.hidden = hidden
+        raw_h = (
+            int(D * cfg.mlp_ratio * 2.0 / 3.0)
+            if cfg.mlp_ratio <= 3.0
+            else int(D * cfg.mlp_ratio)
+        )
+        hidden = ((max(raw_h, 64) + 63) // 64) * 64
         self.gate_up = torch_linear(D, 2 * hidden, cfg, rngs=rngs, use_bias=False)
         self.down = torch_linear(hidden, D, cfg, rngs=rngs, use_bias=False)
 
     def __call__(
         self, x: jax.Array, deterministic: bool, rng: jax.Array | None = None
     ) -> jax.Array:
-        gu = self.gate_up(x)
-        gate, up = jnp.split(gu, 2, axis=-1)
-        h = jax.nn.silu(gate) * up
-        h = _dropout(h, self.cfg.dropout, deterministic, rng)
+        gate, up = jnp.split(self.gate_up(x), 2, axis=-1)
+        h = _dropout(jax.nn.silu(gate) * up, self.cfg.dropout, deterministic, rng)
         return self.down(h)
 
 
 class EncoderBlockV2(nnx.Module):
-    """Pre-RMSNorm + AdaLN + Ray-GAB + QK-Norm MHA + SwiGLU."""
+    """Strict S=64 Pre-RMSNorm + Bottleneck AdaLN + Zero-Copy Ray-GAB + QK-Norm MHA + SwiGLU."""
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         D = cfg.dim_vit
-        self.norm1 = rms_norm(D, cfg, rngs=rngs) if cfg.use_rms_norm else layer_norm(D, cfg, rngs=rngs)
-        self.norm2 = rms_norm(D, cfg, rngs=rngs) if cfg.use_rms_norm else layer_norm(D, cfg, rngs=rngs)
+        self.norm1 = (
+            rms_norm(D, cfg, rngs=rngs)
+            if cfg.use_rms_norm
+            else layer_norm(D, cfg, rngs=rngs)
+        )
+        self.norm2 = (
+            rms_norm(D, cfg, rngs=rngs)
+            if cfg.use_rms_norm
+            else layer_norm(D, cfg, rngs=rngs)
+        )
         if cfg.use_adaln:
-            self.adaln = zero_linear(D, 6 * D, cfg, rngs=rngs)
+            self.adaln = zero_linear(ADALN_BOTTLENECK, 6 * D, cfg, rngs=rngs)
         if cfg.pos_encoding == "gab":
             self.sq_bias = RayGABBias(cfg, rngs=rngs)
         elif cfg.pos_encoding == "relative":
@@ -244,20 +259,18 @@ class EncoderBlockV2(nnx.Module):
     def __call__(
         self,
         x: jax.Array,
-        cond: jax.Array,
+        cond_low: jax.Array,
         gab_weight: jax.Array | None,
         ray_feats: jax.Array | None,
         deterministic: bool,
         rng: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         c = self.cfg
-        R = c.num_registers
         r_attn, r_d1, r_mlp, r_d2 = (
             (None, None, None, None) if rng is None else jax.random.split(rng, 4)
         )
-
         if c.use_adaln:
-            mods = self.adaln(jax.nn.silu(cond)).astype(jnp.float32)[:, None, :]
+            mods = self.adaln(cond_low).astype(jnp.float32)[:, None, :]
             sh_a, sc_a, gt_a, sh_m, sc_m, gt_m = jnp.split(mods, 6, axis=-1)
         else:
             sh_a = sc_a = gt_a = sh_m = sc_m = gt_m = 0.0
@@ -267,13 +280,9 @@ class EncoderBlockV2(nnx.Module):
         if c.pos_encoding == "gab":
             if gab_weight is None:
                 raise ValueError("GAB positional encoding requires gab_shared_weight")
-            sq_b = self.sq_bias(h1[:, :64, :], gab_weight, ray_feats)
-            bias = (
-                jnp.pad(sq_b, ((0, 0), (0, 0), (0, R), (0, R))) if R > 0 else sq_b
-            )
+            bias = self.sq_bias(h1, gab_weight, ray_feats)
         elif c.pos_encoding == "relative":
-            rb = self.relative_bias()[None]
-            bias = jnp.pad(rb, ((0, 0), (0, 0), (0, R), (0, R))) if R > 0 else rb
+            bias = self.relative_bias()[None]
 
         a_out, attn_sq = self.attn(h1, bias, deterministic, r_attn)
         a_out = _dropout(a_out, c.dropout, deterministic, r_d1)
@@ -288,15 +297,46 @@ class EncoderBlockV2(nnx.Module):
                 if c.activation == "gelu"
                 else nnx.relu
             )
-            m_out = self.linear2(_dropout(act(self.linear1(h2)), c.dropout, deterministic, r_mlp))
+            m_out = self.linear2(
+                _dropout(act(self.linear1(h2)), c.dropout, deterministic, r_mlp)
+            )
         m_out = _dropout(m_out, c.dropout, deterministic, r_d2)
         x = x + (1.0 + gt_m) * m_out.astype(jnp.float32)
         return x, attn_sq
 
 
-class BilinearMoveHead(nnx.Module):
-    """Shared bilinear + promotion geometry used for both primary policy and 2-ply reply head."""
+class CrossAttentionPool(nnx.Module):
+    """Selective [CLS_VALUE, CLS_PONDER] readout after trunk while keeping trunk S=64."""
 
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        D = cfg.dim_vit
+        self.queries = nnx.Param(_normal(0.02)(rngs.params(), (2, D), cfg.pdtype))
+        self.q_proj = torch_linear(D, D, cfg, rngs=rngs, use_bias=False)
+        self.k_proj = torch_linear(D, D, cfg, rngs=rngs, use_bias=False)
+        self.v_proj = torch_linear(D, D, cfg, rngs=rngs, use_bias=False)
+        self.out_proj = torch_linear(D, D, cfg, rngs=rngs)
+
+    def __call__(self, x_boards: jax.Array, cond: jax.Array) -> tuple[jax.Array, jax.Array]:
+        c = self.cfg
+        B, S, D = x_boards.shape
+        H = c.num_heads
+        hd = D // H
+        q_in = self.queries.value.astype(jnp.float32)[None] + cond[:, None, :]
+        q = self.q_proj(q_in).reshape(B, 2, H, hd)
+        k = self.k_proj(x_boards).reshape(B, S, H, hd)
+        v = self.v_proj(x_boards).reshape(B, S, H, hd)
+        logits = jnp.einsum(
+            "bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32
+        ) / math.sqrt(hd)
+        w = jax.nn.softmax(logits, axis=-1).astype(c.dtype)
+        pooled = self.out_proj(
+            jnp.einsum("bhqk,bkhd->bqhd", w, v).reshape(B, 2, D)
+        ).astype(jnp.float32)
+        return pooled[:, 0, :] + cond, pooled[:, 1, :] + cond
+
+
+class BilinearMoveHead(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, with_attn_res: bool, rngs: nnx.Rngs):
         self.cfg = cfg
         D, hh = cfg.dim_vit, cfg.head_hid_dim
@@ -307,7 +347,7 @@ class BilinearMoveHead(nnx.Module):
         self.promo_bias_proj = torch_linear(hh, 4, cfg, rngs=rngs, use_bias=False)
         if with_attn_res:
             res_heads = cfg.num_heads * min(2, cfg.num_blocks)
-            self.attn_proj = zero_linear(res_heads, 1, cfg, rngs=rngs)
+            self.attn_w = nnx.Param(jnp.zeros((res_heads,), dtype=cfg.pdtype))
 
     def __call__(
         self, x_sq: jax.Array, recent_attn: jax.Array | None = None
@@ -319,12 +359,14 @@ class BilinearMoveHead(nnx.Module):
         scores = jnp.einsum(
             "bid,bjd->bij", sq_from, sq_to, preferred_element_type=jnp.float32
         ) / math.sqrt(hh)
-        scores = scores + self.from_prior(x_sq).astype(jnp.float32)  # (B, 64, 1)
+        scores = scores + self.from_prior(x_sq).astype(jnp.float32)
 
         if self.with_attn_res and recent_attn is not None:
-            # recent_attn: (B, K*H, 64, 64) -> (B, 64, 64, K*H)
-            a_feat = recent_attn.transpose(0, 2, 3, 1).astype(self.cfg.dtype)
-            scores = scores + self.attn_proj(a_feat).astype(jnp.float32)[..., 0]
+            scores = scores + jnp.einsum(
+                "bhij,h->bij",
+                recent_attn.astype(jnp.float32),
+                self.attn_w.value.astype(jnp.float32),
+            )
 
         promo_bias = self.promo_bias_proj(sq_to[:, 56:64]).astype(
             jnp.float32
@@ -344,19 +386,12 @@ class ChessformerV2(nnx.Module):
             )
 
         self.cond_net = ContextConditioner(cfg, rngs=rngs)
-        # Square token input: 12*H pieces + 1 EP target + 4 sq coords + 8 board_meta + 6 rich_time
         sq_in_dim = 12 * cfg.history + 1 + 4 + 8 + 6
         self.token_projection = torch_linear(sq_in_dim, D, cfg, rngs=rngs)
         self.cond_to_sq = torch_linear(D, D, cfg, rngs=rngs, use_bias=False)
 
-        if cfg.num_registers > 0:
-            self.registers = nnx.Param(
-                _normal(0.02)(rngs.params(), (cfg.num_registers, D), cfg.pdtype)
-            )
         if cfg.pos_encoding == "absolute":
-            self.abs_pe = nnx.Param(
-                _normal(0.02)(rngs.params(), (64, D), cfg.pdtype)
-            )
+            self.abs_pe = nnx.Param(_normal(0.02)(rngs.params(), (64, D), cfg.pdtype))
         if cfg.pos_encoding == "gab":
             gstd = math.sqrt(2.0 / (64 * 64 + cfg.gab_gen_size))
             self.gab_shared_weight = nnx.Param(
@@ -365,7 +400,13 @@ class ChessformerV2(nnx.Module):
 
         for i in range(cfg.num_blocks):
             setattr(self, f"block_{i}", EncoderBlockV2(cfg, rngs=rngs))
-        self.final_norm = rms_norm(D, cfg, rngs=rngs) if cfg.use_rms_norm else layer_norm(D, cfg, rngs=rngs)
+        self.final_norm = (
+            rms_norm(D, cfg, rngs=rngs)
+            if cfg.use_rms_norm
+            else layer_norm(D, cfg, rngs=rngs)
+        )
+        if cfg.num_registers > 0:
+            self.readout_pool = CrossAttentionPool(cfg, rngs=rngs)
         self.value_norm = layer_norm(D, cfg, rngs=rngs)
         self.ponder_norm = layer_norm(D, cfg, rngs=rngs)
 
@@ -383,17 +424,17 @@ class ChessformerV2(nnx.Module):
         self.fc_ponder = torch_linear(hh, cfg.ponder_buckets, cfg, rngs=rngs)
 
     def _compute_ray_features(self, current_board: jax.Array) -> jax.Array:
-        """current_board: int8 (B, 64) -> exact ray features (B, 64, 64, 8) in compute_dtype."""
+        """current_board: int8 (B, 64) -> (B, 8, 64, 64) in compute_dtype (zero transposes)."""
         cdt = self.cfg.dtype
-        occ = (current_board > 0).astype(cdt)  # (B, 64)
-        ray_between = jnp.asarray(cu.RAY_BETWEEN, dtype=cdt)  # (64, 4096)
+        occ = (current_board > 0).astype(cdt)
+        ray_between = jnp.asarray(cu.RAY_BETWEEN, dtype=cdt)
         blockers = jnp.einsum(
             "bs,sp->bp", occ, ray_between, preferred_element_type=jnp.float32
         ).reshape(-1, 1, 64, 64)
-        dirs = jnp.asarray(cu.RAY_DIR_MASK, dtype=jnp.float32)[None, :, :, :]  # (1, 4, 64, 64)
-        clear = (blockers < 0.5).astype(jnp.float32) * dirs  # direct line of sight
-        pin_xray = ((blockers > 0.5) & (blockers < 1.5)).astype(jnp.float32) * dirs  # 1 blocker
-        return jnp.concatenate([clear, pin_xray], axis=1).transpose(0, 2, 3, 1).astype(cdt)
+        dirs = jnp.asarray(cu.RAY_DIR_MASK, dtype=jnp.float32)[None]
+        clear = (blockers < 0.5).astype(cdt) * dirs.astype(cdt)
+        pin_xray = ((blockers > 0.5) & (blockers < 1.5)).astype(cdt) * dirs.astype(cdt)
+        return jnp.concatenate([clear, pin_xray], axis=1)
 
     def __call__(
         self,
@@ -433,7 +474,7 @@ class ChessformerV2(nnx.Module):
         if game_format is None:
             game_format = jnp.zeros((B,), jnp.int32)
 
-        cond = self.cond_net(
+        cond, cond_low = self.cond_net(
             self_elo,
             oppo_elo,
             self_title,
@@ -442,7 +483,7 @@ class ChessformerV2(nnx.Module):
             board_meta,
             rich_time,
             has_clock,
-        )  # (B, D) fp32
+        )
 
         onehot = (boards[..., None] == jnp.arange(1, 13, dtype=boards.dtype)).astype(cdt)
         piece_tok = onehot.transpose(0, 2, 1, 3).reshape(B, 64, H * 12)
@@ -454,18 +495,12 @@ class ChessformerV2(nnx.Module):
         time_tok = jnp.broadcast_to(rich_time[:, None, :].astype(cdt), (B, 64, 6))
 
         sq_in = jnp.concatenate([piece_tok, ep_tok, coords, meta_tok, time_tok], axis=-1)
-        x_sq = self.token_projection(sq_in).astype(jnp.float32) + self.cond_to_sq(
+        x = self.token_projection(sq_in).astype(jnp.float32) + self.cond_to_sq(
             cond.astype(cdt)
         ).astype(jnp.float32)[:, None, :]
 
         if c.pos_encoding == "absolute":
-            x_sq = x_sq + self.abs_pe.value.astype(jnp.float32)[None]
-
-        if c.num_registers > 0:
-            regs = self.registers.value.astype(jnp.float32)[None] + cond[:, None, :]
-            x = jnp.concatenate([x_sq, regs], axis=1)
-        else:
-            x = x_sq
+            x = x + self.abs_pe.value.astype(jnp.float32)[None]
 
         gab_w = self.gab_shared_weight.value if c.pos_encoding == "gab" else None
         ray_feats = (
@@ -487,37 +522,39 @@ class ChessformerV2(nnx.Module):
                 blk_def, blk_state = nnx.split(blk)
 
                 @jax.checkpoint
-                def _ckpt_blk(b_st, x_in, c_in, gw_in, rf_in, r_in):
+                def _ckpt_blk(b_st, x_in, cl_in, gw_in, rf_in, r_in):
                     m = nnx.merge(blk_def, b_st)
-                    return m(x_in, c_in, gw_in, rf_in, False, r_in)
+                    return m(x_in, cl_in, gw_in, rf_in, False, r_in)
 
                 x, attn_sq = _ckpt_blk(
-                    blk_state, x, cond, gab_w, ray_feats, blk_rngs[i]
+                    blk_state, x, cond_low, gab_w, ray_feats, blk_rngs[i]
                 )
             elif c.remat_blocks:
                 blk_def, blk_state = nnx.split(blk)
 
                 @jax.checkpoint
-                def _ckpt_blk_det(b_st, x_in, c_in, gw_in, rf_in):
+                def _ckpt_blk_det(b_st, x_in, cl_in, gw_in, rf_in):
                     m = nnx.merge(blk_def, b_st)
-                    return m(x_in, c_in, gw_in, rf_in, True, None)
+                    return m(x_in, cl_in, gw_in, rf_in, True, None)
 
-                x, attn_sq = _ckpt_blk_det(blk_state, x, cond, gab_w, ray_feats)
+                x, attn_sq = _ckpt_blk_det(blk_state, x, cond_low, gab_w, ray_feats)
             else:
-                x, attn_sq = blk(x, cond, gab_w, ray_feats, deterministic, blk_rngs[i])
+                x, attn_sq = blk(
+                    x, cond_low, gab_w, ray_feats, deterministic, blk_rngs[i]
+                )
             if c.use_attn_policy_residual and i >= keep_from:
                 recent_attns.append(attn_sq)
 
-        x = self.final_norm(x)
-        x_boards = x[:, :64, :]
+        x_boards = self.final_norm(x)
         stacked_attn = (
             jnp.concatenate(recent_attns, axis=1) if recent_attns else None
         )
         logits_move = self.policy_head(x_boards, stacked_attn)
 
-        if c.num_registers >= 2:
-            v_tok = self.value_norm(x[:, 64, :])
-            p_tok = self.ponder_norm(x[:, 65, :])
+        if c.num_registers > 0:
+            v_raw, p_raw = self.readout_pool(x_boards, cond)
+            v_tok = self.value_norm(v_raw)
+            p_tok = self.ponder_norm(p_raw)
         else:
             pooled = x_boards.mean(axis=1)
             v_tok = self.value_norm(pooled)
@@ -537,7 +574,8 @@ class ChessformerV2(nnx.Module):
         )
         if clk_left is not None:
             ponder_sec = jnp.expm1(
-                ponder_effort * jnp.log1p(jnp.maximum(clk_left.astype(jnp.float32), 1.0))
+                ponder_effort
+                * jnp.log1p(jnp.maximum(clk_left.astype(jnp.float32), 1.0))
             )
         else:
             ponder_sec = ponder_effort * 10.0
@@ -550,7 +588,6 @@ class ChessformerV2(nnx.Module):
             "ponder_effort": ponder_effort,
         }
         if c.use_opponent_reply_head:
-            # Mirror board tokens along ranks so opponent's reply aligns with 4352 vocab (incl. rank-8 promos)
             mirror_idx = jnp.asarray(cu.MIRROR_SQ)
             x_opp = self.reply_norm(x_boards[:, mirror_idx, :])
             aux["reply_logits"] = self.reply_head(x_opp, None)

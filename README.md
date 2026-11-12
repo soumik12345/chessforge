@@ -124,6 +124,47 @@ gcloud compute tpus tpu-vm ssh "$TPU" --zone "$ZONE" --worker=all --command "
     > train.log 2>&1 &"
 ```
 
+#### Customizing Metrics Logging
+
+`Trainer(cfg)` uses a `MetricsLogger` callback for console output, window-averaged
+training metrics, throughput, and optional experiment tracking.
+[Trackio](https://huggingface.co/docs/trackio/en/index) is the default backend
+(`tracking_backend: trackio`). Set its project to enable tracking:
+
+```bash
+python -m chessforge.cli.train --config configs/maia3_5m.yaml \
+  --set trackio_project=chessforge
+```
+
+To use W&B, set `tracking_backend=wandb wandb_project=your-project` instead.
+
+Trackio stores metrics locally by default; set `TRACKIO_DIR` to choose its storage
+directory. Only the selected backend is imported, and leaving its project empty
+keeps console logging only. Only process zero reports metrics, and the tracking
+run is finished even if training fails. Logging intervals are unchanged.
+
+To customize tracking, subclass `Callback` and override `on_train_start`,
+`on_train_step_end`, `on_eval_end`, or `on_train_end` as needed:
+
+```python
+from chessforge.train import Callback, MetricsLogger
+from chessforge.train.trainer import Trainer
+
+
+class EvaluationCallback(Callback):
+    def on_eval_end(self, step, split, results):
+        print(step, split, results["overall"])
+
+
+Trainer(cfg, callbacks=[MetricsLogger(), EvaluationCallback()]).fit()
+```
+
+An explicit callback list replaces the default; `callbacks=[]` disables metric
+logging. Hooks run on every host, so custom callbacks should guard host-specific
+side effects. Step hooks receive device metrics; evaluation hooks receive the full
+result dictionary. Finalization runs in reverse callback order, including after
+errors in training or callback startup.
+
 #### Step 5: Evaluate Your Trained Checkpoints
 During training, `Trainer.fit()` automatically evaluates on `val_glob` every 10,000 steps and on `test_glob` (ALLIE test set) every 50,000 steps and at step 1,000,000. You can also run standalone evaluation (in `float32` or `bfloat16`) at any checkpoint step:
 

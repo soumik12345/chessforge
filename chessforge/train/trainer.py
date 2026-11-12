@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-import time
+from collections.abc import Sequence
+from contextlib import ExitStack
 from typing import Any, cast
 
 import jax
@@ -16,7 +17,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from chessforge.config import TrainConfig, config_to_dict
 from chessforge.data import pipeline
 from chessforge.eval.evaluate import make_eval_step, run_eval
-from chessforge.models import build_model, build_model_config, count_params
+from chessforge.models import build_model, build_model_config
+from chessforge.train.callbacks import Callback, MetricsLogger
 from chessforge.train.losses import maia3_loss
 from chessforge.train.schedule import maia3_lr_schedule
 
@@ -44,8 +46,11 @@ def log0(msg: str):
 
 
 class Trainer:
-    def __init__(self, cfg: TrainConfig):
+    """Train a model, using MetricsLogger unless explicit callbacks are supplied."""
+
+    def __init__(self, cfg: TrainConfig, callbacks: Sequence[Callback] | None = None):
         self.cfg = cfg
+        self.callbacks = list(callbacks) if callbacks is not None else [MetricsLogger()]
         self.model_cfg = build_model_config(cfg.model, cfg.model_overrides)
         self.graphdef, _ = nnx.split(build_model(self.model_cfg, rngs=0))
         self.mesh = Mesh(np.asarray(jax.devices()), ("data",))
@@ -151,7 +156,6 @@ class Trainer:
             donate_argnums=(0,),
         )
         self.p_init = jax.jit(self._init_state, out_shardings=self.repl)
-        self.p_add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
         self.eval_step = make_eval_step(self.graphdef, self.data_sharding, self.repl)
 
     def to_global(self, batch):
@@ -227,10 +231,6 @@ class Trainer:
     # --------------------------------------------------------------------- fit
     def fit(self):
         cfg, o, d = self.cfg, self.cfg.optim, self.cfg.data
-        log0(
-            f"model={self.model_cfg.name} params={count_params(self.model_cfg):,} devices={jax.device_count()} "
-            f"hosts={jax.process_count()} global_batch={d.global_batch_size}"
-        )
         if jax.process_index() == 0:
             self.workdir.mkdir(parents=True, exist_ok=True)
             (self.workdir / "config.json").write_text(
@@ -250,57 +250,31 @@ class Trainer:
                         f"[warn] data state restore failed ({e}); continuing with fresh iterator"
                     )
         n_total = n_local * jax.process_count()
-        log0(
-            f"~{n_total:,} training positions; {o.total_steps} steps = "
-            f"{o.total_steps * d.global_batch_size / max(n_total, 1):.2f} epochs"
-        )
 
-        wandb = None
-        if cfg.wandb_project and jax.process_index() == 0:
-            import wandb as _wandb
+        with ExitStack() as stack:
+            for callback in self.callbacks:
+                stack.callback(callback.on_train_end)
+                callback.on_train_start(cfg, self.model_cfg, n_total)
 
-            wandb = _wandb
-            wandb.init(
-                project=cfg.wandb_project,
-                config=config_to_dict(cfg),
-                name=self.model_cfg.name,
-            )
+            base_rng = jax.device_put(jax.random.PRNGKey(cfg.seed + 1), self.repl)
+            step = int(state.step)
+            while step < o.total_steps:
+                batch = self.to_global(next(train_it))
+                state, metrics = self.p_train_step(state, batch, base_rng)
+                step += 1
+                for callback in self.callbacks:
+                    callback.on_train_step_end(step, metrics)
 
-        base_rng = jax.device_put(jax.random.PRNGKey(cfg.seed + 1), self.repl)
-        step = int(state.step)
-        acc, n_acc, t0 = None, 0, time.time()
-        while step < o.total_steps:
-            batch = self.to_global(next(train_it))
-            state, metrics = self.p_train_step(state, batch, base_rng)
-            step += 1
-            acc = metrics if acc is None else self.p_add(acc, metrics)
-            n_acc += 1
-
-            if step % cfg.log_every == 0:
-                m = {k: float(v) / n_acc for k, v in jax.device_get(acc).items()}
-                dt = time.time() - t0
-                m["positions_per_sec"] = n_acc * d.global_batch_size / dt
-                log0(f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items()))
-                if wandb:
-                    wandb.log({f"train/{k}": v for k, v in m.items()}, step=step)
-                acc, n_acc, t0 = None, 0, time.time()
-
-            last = step == o.total_steps
-            if d.val_glob and (step % cfg.eval_every == 0 or last):
-                r = self.evaluate(state.params, d.val_glob, d.val_batches)
-                log0(f"[val] step {step} {json.dumps(r['overall'])}")
-                if wandb:
-                    wandb.log(
-                        {f"val/{k}": v for k, v in r["overall"].items()}, step=step
-                    )
-            if d.test_glob and (step % cfg.test_every == 0 or last):
-                r = self.evaluate(state.params, d.test_glob)
-                log0(f"[test] step {step} {json.dumps(r['overall'])}")
-                if wandb:
-                    wandb.log(
-                        {f"test/{k}": v for k, v in r["overall"].items()}, step=step
-                    )
-            if step % cfg.ckpt_every == 0 or last:
-                self.save(state, train_it)
-        self.ckpt.wait_until_finished()
+                last = step == o.total_steps
+                if d.val_glob and (step % cfg.eval_every == 0 or last):
+                    r = self.evaluate(state.params, d.val_glob, d.val_batches)
+                    for callback in self.callbacks:
+                        callback.on_eval_end(step, "val", r)
+                if d.test_glob and (step % cfg.test_every == 0 or last):
+                    r = self.evaluate(state.params, d.test_glob)
+                    for callback in self.callbacks:
+                        callback.on_eval_end(step, "test", r)
+                if step % cfg.ckpt_every == 0 or last:
+                    self.save(state, train_it)
+            self.ckpt.wait_until_finished()
         return state

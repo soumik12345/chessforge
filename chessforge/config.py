@@ -95,6 +95,8 @@ class TrainConfig:
     ckpt_every: int = 10_000
     keep_checkpoints: int = 3
     wandb_project: str = ""
+    tracking_backend: str = "trackio"  # trackio | wandb; empty project => console only
+    trackio_project: str = ""
 
 
 def _from_dict(cls, d: dict[str, Any]):

@@ -72,7 +72,9 @@ def _build_rich_time_and_meta(
     l_inc = np.log1p(np.maximum(inc_s, 0.0)) / 4.0
     l_self = np.log1p(np.maximum(clk_left, 0.0)) / 8.0
     l_opp = np.log1p(np.maximum(opp_clk_left, 0.0)) / 8.0
-    prev_p = np.where(np.isfinite(prev_opp_ponder), np.maximum(prev_opp_ponder, 0.0), 0.0)
+    prev_p = np.where(
+        np.isfinite(prev_opp_ponder), np.maximum(prev_opp_ponder, 0.0), 0.0
+    )
     l_prev = np.log1p(prev_p) / 5.0
     rich_time = np.stack(
         [l_base, l_inc, l_self, l_opp, (l_self - l_opp) * 2.0, l_prev], axis=-1
@@ -258,9 +260,7 @@ class FastShardIterator:
                     np.zeros((0, MAX_LEGAL_MOVES), dtype=np.int16),
                 )
             recs = (
-                r.read_all()
-                if hasattr(r, "read_all")
-                else [r.read() for _ in range(n)]
+                r.read_all() if hasattr(r, "read_all") else [r.read() for _ in range(n)]
             )
         finally:
             r.close()

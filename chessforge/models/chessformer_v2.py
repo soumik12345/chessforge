@@ -19,6 +19,7 @@ from chessforge.models.chessformer import (
     layer_norm,
     torch_linear,
 )
+from chessforge.models.joint_time import joint_move_log_probs
 
 RMS_EPS = float(np.finfo(np.float32).eps)
 ADALN_BOTTLENECK = 128
@@ -140,9 +141,11 @@ class RayGABBias(nnx.Module):
                 self.ray_w.value.astype(self.cfg.dtype),
                 preferred_element_type=jnp.float32,
             )
-            static_b = self.rel_table.value[jnp.asarray(cu.PAIR_REL_INDEX)].astype(
-                jnp.float32
-            ).transpose(2, 0, 1)
+            static_b = (
+                self.rel_table.value[jnp.asarray(cu.PAIR_REL_INDEX)]
+                .astype(jnp.float32)
+                .transpose(2, 0, 1)
+            )
             bias = bias + rb + static_b[None]
         return bias
 
@@ -317,7 +320,9 @@ class CrossAttentionPool(nnx.Module):
         self.v_proj = torch_linear(D, D, cfg, rngs=rngs, use_bias=False)
         self.out_proj = torch_linear(D, D, cfg, rngs=rngs)
 
-    def __call__(self, x_boards: jax.Array, cond: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(
+        self, x_boards: jax.Array, cond: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         c = self.cfg
         B, S, D = x_boards.shape
         H = c.num_heads
@@ -376,10 +381,63 @@ class BilinearMoveHead(nnx.Module):
         return jnp.concatenate([scores.reshape(B, 64 * 64), promo], axis=-1)
 
 
+class EffortMoveResidual(nnx.Module):
+    """Small bilinear correction per effort bucket, sharing the 64-square trunk.
+
+    Zero gates start every bucket at the original policy. Once the gates learn,
+    gradients also reach the shared from/to projections and promotion weights.
+    """
+
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.rank = cfg.joint_move_time_rank
+        self.dtype = cfg.dtype
+        self.proj_from = torch_linear(
+            cfg.dim_vit, self.rank, cfg, rngs=rngs, use_bias=False
+        )
+        self.proj_to = torch_linear(
+            cfg.dim_vit, self.rank, cfg, rngs=rngs, use_bias=False
+        )
+        self.effort_gates = nnx.Param(
+            jnp.zeros((cfg.ponder_buckets, self.rank), dtype=cfg.pdtype)
+        )
+        self.promo_weight = nnx.Param(
+            _normal(1.0 / math.sqrt(self.rank))(
+                rngs.params(), (self.rank, 4), cfg.pdtype
+            )
+        )
+
+    def __call__(self, x: jax.Array, base_logits: jax.Array) -> jax.Array:
+        f, t = self.proj_from(x), self.proj_to(x)
+        gates = self.effort_gates.value.astype(self.dtype)
+        # Contract the small rank axis; never repeat the transformer per bucket.
+        scores = jnp.einsum(
+            "bir,bjr,kr->bkij", f, t, gates, preferred_element_type=jnp.float32
+        ) / math.sqrt(self.rank)
+        promo_bias = jnp.einsum(
+            "bjr,kr,rp->bkjp",
+            t[:, 56:64],
+            gates,
+            self.promo_weight.value.astype(self.dtype),
+            preferred_element_type=jnp.float32,
+        ) * math.sqrt(self.rank)
+        promo = scores[:, :, 48:56, 56:64, None] + promo_bias[:, :, None, :, :]
+        B, K = scores.shape[:2]
+        residual = jnp.concatenate(
+            [scores.reshape(B, K, 4096), promo.reshape(B, K, 256)], axis=-1
+        )
+        return base_logits[:, None, :] + residual
+
+
 class ChessformerV2(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         D, hh = cfg.dim_vit, cfg.head_hid_dim
+        if cfg.use_joint_move_time and (
+            cfg.joint_move_time_rank < 1 or cfg.ponder_buckets < 2
+        ):
+            raise ValueError(
+                "Joint move/time requires positive rank and at least 2 buckets"
+            )
         if cfg.gab_per_square_dim == 0 and cfg.pos_encoding == "gab":
             raise ValueError(
                 "ChessformerV2 requires gab_per_square_dim > 0 so GAB is spatially aware."
@@ -422,6 +480,9 @@ class ChessformerV2(nnx.Module):
 
         self.fc_ponder_hid = torch_linear(D, hh, cfg, rngs=rngs)
         self.fc_ponder = torch_linear(hh, cfg.ponder_buckets, cfg, rngs=rngs)
+        # Append after existing modules to preserve their seeded initialization.
+        if cfg.use_joint_move_time:
+            self.effort_move_residual = EffortMoveResidual(cfg, rngs=rngs)
 
     def _compute_ray_features(self, current_board: jax.Array) -> jax.Array:
         """current_board: int8 (B, 64) -> (B, 8, 64, 64) in compute_dtype (zero transposes)."""
@@ -450,6 +511,7 @@ class ChessformerV2(nnx.Module):
         oppo_title: jax.Array | None = None,
         game_format: jax.Array | None = None,
         clk_left: jax.Array | None = None,
+        legal: jax.Array | None = None,
         deterministic: bool = True,
         rng: jax.Array | None = None,
         return_aux: bool = False,
@@ -485,19 +547,26 @@ class ChessformerV2(nnx.Module):
             has_clock,
         )
 
-        onehot = (boards[..., None] == jnp.arange(1, 13, dtype=boards.dtype)).astype(cdt)
+        onehot = (boards[..., None] == jnp.arange(1, 13, dtype=boards.dtype)).astype(
+            cdt
+        )
         piece_tok = onehot.transpose(0, 2, 1, 3).reshape(B, 64, H * 12)
         ep_tok = (
             jnp.arange(64, dtype=jnp.int32)[None, :] == ep_square_idx[:, None]
         ).astype(cdt)[..., None]
-        coords = jnp.broadcast_to(jnp.asarray(cu.SQ_COORDS, dtype=cdt)[None], (B, 64, 4))
+        coords = jnp.broadcast_to(
+            jnp.asarray(cu.SQ_COORDS, dtype=cdt)[None], (B, 64, 4)
+        )
         meta_tok = jnp.broadcast_to(board_meta[:, None, :].astype(cdt), (B, 64, 8))
         time_tok = jnp.broadcast_to(rich_time[:, None, :].astype(cdt), (B, 64, 6))
 
-        sq_in = jnp.concatenate([piece_tok, ep_tok, coords, meta_tok, time_tok], axis=-1)
-        x = self.token_projection(sq_in).astype(jnp.float32) + self.cond_to_sq(
-            cond.astype(cdt)
-        ).astype(jnp.float32)[:, None, :]
+        sq_in = jnp.concatenate(
+            [piece_tok, ep_tok, coords, meta_tok, time_tok], axis=-1
+        )
+        x = (
+            self.token_projection(sq_in).astype(jnp.float32)
+            + self.cond_to_sq(cond.astype(cdt)).astype(jnp.float32)[:, None, :]
+        )
 
         if c.pos_encoding == "absolute":
             x = x + self.abs_pe.value.astype(jnp.float32)[None]
@@ -546,9 +615,7 @@ class ChessformerV2(nnx.Module):
                 recent_attns.append(attn_sq)
 
         x_boards = self.final_norm(x)
-        stacked_attn = (
-            jnp.concatenate(recent_attns, axis=1) if recent_attns else None
-        )
+        stacked_attn = jnp.concatenate(recent_attns, axis=1) if recent_attns else None
         logits_move = self.policy_head(x_boards, stacked_attn)
 
         if c.num_registers > 0:
@@ -566,6 +633,14 @@ class ChessformerV2(nnx.Module):
         ponder_logits = self.fc_ponder(jax.nn.silu(self.fc_ponder_hid(p_tok))).astype(
             jnp.float32
         )
+        conditional_move_logits = None
+        if c.use_joint_move_time:
+            conditional_move_logits = self.effort_move_residual(x_boards, logits_move)
+            # These normalized log probabilities remain valid logits for callers.
+            # The effort prior is predicted from pre-move context, never labels.
+            logits_move, _ = joint_move_log_probs(
+                ponder_logits, conditional_move_logits, legal
+            )
 
         edges = jnp.linspace(0.0, 1.0, c.ponder_buckets + 1, dtype=jnp.float32)
         centers = 0.5 * (edges[:-1] + edges[1:])
@@ -573,10 +648,13 @@ class ChessformerV2(nnx.Module):
             jax.nn.softmax(ponder_logits, axis=-1) * centers[None, :], axis=-1
         )
         if clk_left is not None:
-            ponder_sec = jnp.expm1(
-                ponder_effort
-                * jnp.log1p(jnp.maximum(clk_left.astype(jnp.float32), 1.0))
-            )
+            log_clock = jnp.log1p(jnp.maximum(clk_left.astype(jnp.float32), 1.0))
+            if c.use_joint_move_time:
+                # E[seconds] differs from converting E[effort] through expm1.
+                bucket_sec = jnp.expm1(centers[None, :] * log_clock[:, None])
+                ponder_sec = (jax.nn.softmax(ponder_logits, -1) * bucket_sec).sum(-1)
+            else:
+                ponder_sec = jnp.expm1(ponder_effort * log_clock)
         else:
             ponder_sec = ponder_effort * 10.0
 
@@ -587,6 +665,8 @@ class ChessformerV2(nnx.Module):
             "ponder_logits": ponder_logits,
             "ponder_effort": ponder_effort,
         }
+        if conditional_move_logits is not None:
+            aux["conditional_move_logits"] = conditional_move_logits
         if c.use_opponent_reply_head:
             mirror_idx = jnp.asarray(cu.MIRROR_SQ)
             x_opp = self.reply_norm(x_boards[:, mirror_idx, :])

@@ -60,8 +60,14 @@ def position_dtype(history: int, version: int = FORMAT_VERSION) -> np.dtype:
             ("oppo_title", np.uint8),  # 0..4 official human title tier
             ("game_format", np.uint8),  # 0=blitz, 1=rapid, 2=otb_classical
             ("has_clock", np.uint8),  # 1 if clock data valid, 0 if clockless OTB
-            ("next_move", np.int16),  # -1 if none, else 0..4351 opponent reply (opp frame)
-            ("sf_move", np.int16),  # -1 if unannotated, else Stockfish #1 move (stm frame)
+            (
+                "next_move",
+                np.int16,
+            ),  # -1 if none, else 0..4351 opponent reply (opp frame)
+            (
+                "sf_move",
+                np.int16,
+            ),  # -1 if unannotated, else Stockfish #1 move (stm frame)
             ("sf_cp_loss", np.int16),  # -1 if unannotated, else cp loss vs SF #1
             ("n_legal", np.int16),
         ]

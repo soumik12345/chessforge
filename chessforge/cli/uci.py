@@ -14,14 +14,13 @@ from collections import deque
 
 import chess
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
 from chessforge import chess_utils as cu
 from chessforge.config import load_train_config
 from chessforge.data.pipeline import _build_rich_time_and_meta
-from chessforge.models import build_model, build_model_config, forward_model
+from chessforge.models import build_model, forward_model
 from chessforge.train.trainer import Trainer
 
 
@@ -118,8 +117,11 @@ class ChessforgeUCIEngine:
             np.asarray([epf], np.int32),
             np.asarray([rep_c], np.int32),
         )
+        legal = np.zeros((1, cu.VOCAB_SIZE), dtype=bool)
+        legal[0, cu.legal_move_indices(board).astype(np.int64)] = True
         return {
             "board": rel[None],
+            "legal": legal,
             "time_info": np.asarray(
                 [[self.base_time / 100.0, self.inc_time / 100.0, clk_self / 100.0]],
                 np.float32,
@@ -191,7 +193,11 @@ class ChessforgeUCIEngine:
         )
         lm, _, _, aux = self._infer(self.params, batch)
         logits = np.asarray(lm[0], dtype=np.float64)
-        effort = float(np.asarray(aux["ponder_effort"][0])) if "ponder_effort" in aux else 0.25
+        effort = (
+            float(np.asarray(aux["ponder_effort"][0]))
+            if "ponder_effort" in aux
+            else 0.25
+        )
 
         mask = np.zeros(cu.VOCAB_SIZE, dtype=bool)
         mask[leg_idx.astype(np.int64)] = True
@@ -254,7 +260,9 @@ class ChessforgeUCIEngine:
         temp = self.temperature
         if temp > 0 and self.effort_temp:
             # Lower temperature on instant recaptures (low effort) & sharp tactical spikes
-            temp = temp * float(np.clip(0.65 + 1.2 * effort * (1.0 - effort), 0.5, 1.05))
+            temp = temp * float(
+                np.clip(0.65 + 1.2 * effort * (1.0 - effort), 0.5, 1.05)
+            )
 
         if temp <= 0.0 or len(cands) == 1:
             chosen = cands[0]["move"]
@@ -267,7 +275,9 @@ class ChessforgeUCIEngine:
                 if c["prob"] >= self.min_p * best_p
                 and (best_exp - c["score_exp"]) <= self.max_wdl_drop
             ] or [cands[0]]
-            v_logits = np.array([logits[c["idx"]] / temp for c in viable], dtype=np.float64)
+            v_logits = np.array(
+                [logits[c["idx"]] / temp for c in viable], dtype=np.float64
+            )
             vp = np.exp(v_logits - np.max(v_logits))
             vp /= vp.sum()
             chosen = viable[int(self.rng.choice(len(viable), p=vp))]["move"]
@@ -360,15 +370,23 @@ class ChessforgeUCIEngine:
             if line == "uci":
                 print("id name ChessForge-Master")
                 print("id author ChessForge")
-                print(f"option name Elo type spin default {int(self.self_elo)} min 400 max 3400")
-                print(f"option name SelfElo type spin default {int(self.self_elo)} min 400 max 3400")
-                print(f"option name OppoElo type spin default {int(self.oppo_elo)} min 400 max 3400")
+                print(
+                    f"option name Elo type spin default {int(self.self_elo)} min 400 max 3400"
+                )
+                print(
+                    f"option name SelfElo type spin default {int(self.self_elo)} min 400 max 3400"
+                )
+                print(
+                    f"option name OppoElo type spin default {int(self.oppo_elo)} min 400 max 3400"
+                )
                 print("option name Title type string default GM")
                 print("option name Format type string default otb")
                 print(f"option name Temperature type string default {self.temperature}")
                 print(f"option name MinP type string default {self.min_p}")
                 print(f"option name MaxWDLDrop type string default {self.max_wdl_drop}")
-                print(f"option name MultiPV type spin default {self.multipv} min 1 max 20")
+                print(
+                    f"option name MultiPV type spin default {self.multipv} min 1 max 20"
+                )
                 print("uciok", flush=True)
             elif line == "isready":
                 print("readyok", flush=True)
@@ -408,7 +426,9 @@ def main():
     ap.add_argument("--config", help="Path to training YAML config")
     ap.add_argument("--set", nargs="*", default=[])
     ap.add_argument("--step", type=int, default=None)
-    ap.add_argument("--released", default="maia3-5m", help="Fallback if --config omitted")
+    ap.add_argument(
+        "--released", default="maia3-5m", help="Fallback if --config omitted"
+    )
     ap.add_argument("--elo", type=float, default=2550.0)
     ap.add_argument("--title", default="GM", help="GM|IM|FM|CM|NM|NONE")
     ap.add_argument("--format", default="otb", choices=["blitz", "rapid", "otb"])

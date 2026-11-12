@@ -43,6 +43,8 @@ class ModelConfig:
     use_attn_policy_residual: bool = True
     use_opponent_reply_head: bool = True
     ponder_buckets: int = 16
+    use_joint_move_time: bool = False
+    joint_move_time_rank: int = 16  # rank of the effort-conditioned policy residual
     elo_num_basis: int = 16
     remat_blocks: bool = False  # gradient checkpointing for v5e-1 / 16GB GPUs
 
@@ -102,12 +104,19 @@ class TrainConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     value_coef: float = 0.1
     ponder_coef: float = 0.0
+    joint_time_coef: float = (
+        0.0  # posterior effort CE; 1 gives joint NLL with unsmoothed policy
+    )
     reply_coef: float = 0.0  # 2-ply human opponent reply auxiliary loss
     label_smoothing: float = 0.0
     dpo_coef: float = 0.0  # Anti-Engine DPO / contrastive loss weight
     dpo_beta: float = 0.2
-    sf_max_cp_loss: float = 35.0  # only prefer human over SF when human move loses <= N cp
-    init_from_checkpoint: str = ""  # initialize weights (and DPO ref_params) from checkpoint dir
+    sf_max_cp_loss: float = (
+        35.0  # only prefer human over SF when human move loses <= N cp
+    )
+    init_from_checkpoint: str = (
+        ""  # initialize weights (and DPO ref_params) from checkpoint dir
+    )
     init_from_step: int | None = None
     mask_illegal_in_loss: bool = True
     seed: int = 42

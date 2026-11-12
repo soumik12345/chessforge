@@ -132,7 +132,7 @@ class FastShardIterator:
         buffer_shards: int = 8,
         stored_history: int | None = None,
     ):
-        from array_record.python.array_record_module import ArrayRecordReader
+        from array_record.python.array_record_module import ArrayRecordReader  # ty: ignore[import-not-found]
 
         self._reader_cls = ArrayRecordReader
         self.base_files = list(files)
@@ -365,8 +365,8 @@ class FeaturizeTransform(pygrain.RandomMapTransform):
         self.history_mask_prob = history_mask_prob
         self.with_legal = with_legal
 
-    def random_map(self, raw: bytes, rng: np.random.Generator):
-        rec, legal = records.decode_position(raw)
+    def random_map(self, element: bytes, rng: np.random.Generator):
+        rec, legal = records.decode_position(element)
         stored = rec["boards"].shape[0]
         if self.history > stored:
             raise ValueError(

@@ -13,7 +13,7 @@ from typing import Iterable, Iterator
 import chess
 import numpy as np
 import zstandard
-from array_record.python.array_record_module import ArrayRecordWriter
+from array_record.python.array_record_module import ArrayRecordWriter  # ty: ignore[import-not-found]
 
 from chessforge import chess_utils as cu
 from chessforge.data import records

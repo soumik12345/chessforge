@@ -9,11 +9,13 @@ import os
 import queue
 import shutil
 import threading
+from typing import cast
 
 import grain.python as pygrain
 import jax
 import numpy as np
 from etils import epath
+from grain.sources import RandomAccessDataSource
 from jax.experimental import multihost_utils
 
 from .. import chess_utils as cu
@@ -197,9 +199,7 @@ class FastShardIterator:
                     np.zeros((0, MAX_LEGAL_MOVES), dtype=np.int16),
                 )
             recs = (
-                r.read_all()
-                if hasattr(r, "read_all")
-                else [r.read() for _ in range(n)]
+                r.read_all() if hasattr(r, "read_all") else [r.read() for _ in range(n)]
             )
         finally:
             r.close()
@@ -416,7 +416,11 @@ def _host_dataset(pattern: str, cache_dir: str):
     if shard_by_file:
         files = files[pidx::pcount]
     files = stage_files(files, cache_dir)
-    ds = pygrain.MapDataset.source(pygrain.ArrayRecordDataSource(files))
+    source = cast(
+        RandomAccessDataSource[bytes],
+        pygrain.ArrayRecordDataSource(files),
+    )
+    ds = pygrain.MapDataset.source(source)
     if not shard_by_file:
         ds = ds[pidx::pcount]
     return ds

@@ -67,9 +67,7 @@ def main():
         allow_no_clock=a.allow_no_clock,
         store_legal=True,
     )
-    use_filter = bool(
-        a.filter_game_type or a.titled_mode != "none" or a.min_elo > 0
-    )
+    use_filter = bool(a.filter_game_type or a.titled_mode != "none" or a.min_elo > 0)
     filt = (
         pgn.GameFilter(
             game_type=a.filter_game_type,

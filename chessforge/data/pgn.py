@@ -135,7 +135,9 @@ def parse_time_control_header(tc: str) -> tuple[int, int, bool]:
 
 @dataclasses.dataclass
 class GameFilter:
-    game_type: str = "Blitz"  # comma-separated Event substrings (e.g. "Blitz,Rapid") or "" for OTB
+    game_type: str = (
+        "Blitz"  # comma-separated Event substrings (e.g. "Blitz,Rapid") or "" for OTB
+    )
     require_rated: bool = True
     exclude_bots: bool = True
     exclude_rule_infractions: bool = True
@@ -156,9 +158,10 @@ class GameFilter:
             return False
         if h.get("Variant", "Standard") != "Standard" or "FEN" in h:
             return False
-        if self.exclude_rule_infractions and "infraction" in h.get(
-            "Termination", ""
-        ).lower():
+        if (
+            self.exclude_rule_infractions
+            and "infraction" in h.get("Termination", "").lower()
+        ):
             return False
         wt = h.get("WhiteTitle", "").strip().upper()
         bt = h.get("BlackTitle", "").strip().upper()
@@ -238,7 +241,7 @@ def game_id(h: dict, movetext: str) -> str:
     site = h.get("Site", "")
     if site and "lichess.org/" in site:
         return site.rsplit("/", 1)[-1]
-    key = f"{h.get('Date','')}|{h.get('White','')}|{h.get('Black','')}|{movetext[:128]}"
+    key = f"{h.get('Date', '')}|{h.get('White', '')}|{h.get('Black', '')}|{movetext[:128]}"
     return hashlib.md5(key.encode()).hexdigest()
 
 

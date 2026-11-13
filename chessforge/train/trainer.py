@@ -48,10 +48,30 @@ def log0(msg: str):
         print(msg, flush=True)
 
 
+def summarize_train_metrics(sums: dict, steps: int) -> dict[str, float]:
+    """Average update metrics, but weight joint NLL by valid clock examples."""
+    metrics = {k: float(v) / steps for k, v in sums.items()}
+    if "joint_nll_sum" in sums:
+        weight = float(sums["joint_time_weight"])
+        metrics["joint_time_weight"] = weight
+        metrics["joint_nll"] = float(sums["joint_nll_sum"]) / max(weight, 1e-8)
+        metrics.pop("joint_nll_sum")
+    return metrics
+
+
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.model_cfg = build_model_config(cfg.model, cfg.model_overrides)
+        if cfg.joint_time_coef < 0:
+            raise ValueError("joint_time_coef must be nonnegative")
+        if cfg.joint_time_coef > 0 and not (
+            self.model_cfg.arch == "chessformer_v2"
+            and self.model_cfg.use_joint_move_time
+        ):
+            raise ValueError(
+                "joint_time_coef requires ChessformerV2 use_joint_move_time=true"
+            )
         self.graphdef, _ = nnx.split(build_model(self.model_cfg, rngs=0))
         ndev = jax.device_count()
         accum = cfg.optim.grad_accum_steps
@@ -91,14 +111,25 @@ class Trainer:
         def loss_fn(params, ref_params, batch, rng):
             model = nnx.merge(graphdef, params)
             lm, lv, lp, aux = forward_model(
-                model, batch, deterministic=deterministic, rng=rng, return_aux=True
+                model,
+                batch,
+                deterministic=deterministic,
+                rng=rng,
+                return_aux=True,
+                mask_legal=cfg.mask_illegal_in_loss,
             )
             ref_lm = None
             if ref_params is not None:
                 ref_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), ref_params)
                 ref_model = nnx.merge(graphdef, ref_f32)
                 ref_lm, _, _ = jax.lax.stop_gradient(
-                    forward_model(ref_model, batch, deterministic=True, return_aux=False)
+                    forward_model(
+                        ref_model,
+                        batch,
+                        deterministic=True,
+                        return_aux=False,
+                        mask_legal=cfg.mask_illegal_in_loss,
+                    )
                 )
             return maia3_loss(
                 lm,
@@ -109,6 +140,7 @@ class Trainer:
                 ref_logits_move=ref_lm,
                 value_coef=cfg.value_coef,
                 ponder_coef=cfg.ponder_coef,
+                joint_time_coef=cfg.joint_time_coef,
                 reply_coef=cfg.reply_coef,
                 label_smoothing=cfg.label_smoothing,
                 dpo_coef=cfg.dpo_coef,
@@ -157,6 +189,14 @@ class Trainer:
                 )
                 grads = jax.tree.map(lambda g: g / accum, grads)
                 metrics = jax.tree.map(lambda m: m / accum, metrics)
+            if "joint_nll_sum" in metrics:
+                # Counts and numerators must sum across microbatches, including
+                # those with no clock labels; averaging their means is biased.
+                metrics["joint_time_weight"] *= accum
+                metrics["joint_nll_sum"] *= accum
+                metrics["joint_nll"] = metrics["joint_nll_sum"] / jnp.maximum(
+                    metrics["joint_time_weight"], 1e-8
+                )
             updates, opt_state = self.tx.update(grads, state.opt_state, state.params)
             params = optax.apply_updates(state.params, updates)
             metrics = dict(
@@ -207,7 +247,8 @@ class Trainer:
             state_shape,
         )
         restored = cast(
-            TrainState, mgr.restore(target_step, args=ocp.args.StandardRestore(abstract))
+            TrainState,
+            mgr.restore(target_step, args=ocp.args.StandardRestore(abstract)),
         )
         log0(f"Loaded external weights from {ckpt_dir} at step {target_step}")
         return restored.params
@@ -245,7 +286,8 @@ class Trainer:
             )
             if self.cfg.dpo_coef > 0:
                 self.ref_params = jax.device_put(
-                    jax.tree.map(lambda x: x.astype(jnp.bfloat16), ext_params), self.repl
+                    jax.tree.map(lambda x: x.astype(jnp.bfloat16), ext_params),
+                    self.repl,
                 )
         if latest is not None:
             abstract = jax.tree.map(ocp.utils.to_shape_dtype_struct, state)
@@ -327,61 +369,75 @@ class Trainer:
             f"{o.total_steps * d.global_batch_size / max(n_total, 1):.2f} epochs"
         )
 
-        wandb = None
-        if cfg.wandb_project and jax.process_index() == 0:
-            import wandb as _wandb
+        tracking_run = None
+        if cfg.trackio_project and jax.process_index() == 0:
+            import trackio
 
-            wandb = _wandb
-            wandb.init(
-                project=cfg.wandb_project,
+            tracking_run = trackio.init(
+                project=cfg.trackio_project,
+                space_id=cfg.trackio_space_id,
                 config=config_to_dict(cfg),
-                name=self.model_cfg.name,
+                name=cfg.trackio_run_name or self.model_cfg.name,
+                group=cfg.trackio_group,
+                embed=False,
             )
 
-        base_rng = jax.device_put(jax.random.PRNGKey(cfg.seed + 1), self.repl)
-        acc, n_acc, t0 = None, 0, time.time()
-        while step < o.total_steps:
-            if not in_anneal and step >= anneal_step and d.anneal_glob:
-                log0(f"[curriculum] step {step}: switching to anneal_glob={d.anneal_glob}")
-                train_it, _ = pipeline.make_train_iterator(
-                    d,
-                    self.model_cfg.history,
-                    pattern=d.anneal_glob,
-                    seed=d.shuffle_seed + 99991,
+        try:
+            base_rng = jax.device_put(jax.random.PRNGKey(cfg.seed + 1), self.repl)
+            acc, n_acc, t0 = None, 0, time.time()
+            while step < o.total_steps:
+                if not in_anneal and step >= anneal_step and d.anneal_glob:
+                    log0(
+                        f"[curriculum] step {step}: switching to anneal_glob={d.anneal_glob}"
+                    )
+                    train_it, _ = pipeline.make_train_iterator(
+                        d,
+                        self.model_cfg.history,
+                        pattern=d.anneal_glob,
+                        seed=d.shuffle_seed + 99991,
+                    )
+                    in_anneal = True
+
+                batch = self.to_global(next(train_it))
+                state, metrics = self.p_train_step(
+                    state, self.ref_params, batch, base_rng
                 )
-                in_anneal = True
+                step += 1
+                acc = metrics if acc is None else self.p_add(acc, metrics)
+                n_acc += 1
 
-            batch = self.to_global(next(train_it))
-            state, metrics = self.p_train_step(state, self.ref_params, batch, base_rng)
-            step += 1
-            acc = metrics if acc is None else self.p_add(acc, metrics)
-            n_acc += 1
-
-            if step % cfg.log_every == 0:
-                m = {k: float(v) / n_acc for k, v in jax.device_get(acc).items()}
-                dt = time.time() - t0
-                m["positions_per_sec"] = n_acc * d.global_batch_size / max(dt, 1e-6)
-                log0(f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items()))
-                if wandb:
-                    wandb.log({f"train/{k}": v for k, v in m.items()}, step=step)
-                acc, n_acc, t0 = None, 0, time.time()
-
-            last = step == o.total_steps
-            if d.val_glob and (step % cfg.eval_every == 0 or last):
-                r = self.evaluate(state.params, d.val_glob, d.val_batches)
-                log0(f"[val] step {step} {json.dumps(r['overall'])}")
-                if wandb:
-                    wandb.log(
-                        {f"val/{k}": v for k, v in r["overall"].items()}, step=step
+                if step % cfg.log_every == 0:
+                    m = summarize_train_metrics(jax.device_get(acc), n_acc)
+                    dt = time.time() - t0
+                    m["positions_per_sec"] = n_acc * d.global_batch_size / max(dt, 1e-6)
+                    log0(
+                        f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items())
                     )
-            if d.test_glob and (step % cfg.test_every == 0 or last):
-                r = self.evaluate(state.params, d.test_glob)
-                log0(f"[test] step {step} {json.dumps(r['overall'])}")
-                if wandb:
-                    wandb.log(
-                        {f"test/{k}": v for k, v in r["overall"].items()}, step=step
-                    )
-            if step % cfg.ckpt_every == 0 or last:
-                self.save(state, train_it)
-        self.ckpt.wait_until_finished()
-        return state
+                    if tracking_run is not None:
+                        tracking_run.log(
+                            {f"train/{k}": v for k, v in m.items()}, step=step
+                        )
+                    acc, n_acc, t0 = None, 0, time.time()
+
+                last = step == o.total_steps
+                if d.val_glob and (step % cfg.eval_every == 0 or last):
+                    r = self.evaluate(state.params, d.val_glob, d.val_batches)
+                    log0(f"[val] step {step} {json.dumps(r['overall'])}")
+                    if tracking_run is not None:
+                        tracking_run.log(
+                            {f"val/{k}": v for k, v in r["overall"].items()}, step=step
+                        )
+                if d.test_glob and (step % cfg.test_every == 0 or last):
+                    r = self.evaluate(state.params, d.test_glob)
+                    log0(f"[test] step {step} {json.dumps(r['overall'])}")
+                    if tracking_run is not None:
+                        tracking_run.log(
+                            {f"test/{k}": v for k, v in r["overall"].items()}, step=step
+                        )
+                if step % cfg.ckpt_every == 0 or last:
+                    self.save(state, train_it)
+            self.ckpt.wait_until_finished()
+            return state
+        finally:
+            if tracking_run is not None:
+                tracking_run.finish()

@@ -1,4 +1,8 @@
 model: maia3-79m                    # or maia3-23m
+trackio_project: ""  # set to enable experiment tracking
+trackio_run_name: null  # defaults to the model name
+trackio_group: null
+trackio_space_id: null
 workdir: gs://YOUR_BUCKET/maia3/runs/maia3-79m
 data:
   train_glob: /mnt/maia3data/train/*/train/*.array_record

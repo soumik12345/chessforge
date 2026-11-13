@@ -9,46 +9,130 @@ of measured improvement. No completed J0–J4 results are recorded here yet.
 
 ## 1. Model and objectives
 
-Let `x` denote the board and pre-move context, `m` the observed human move, and
-`k` one of 16 effort buckets. The joint model predicts
+Let $x_n$ denote the board and pre-move context, $m_n$ the observed human
+move, $t_n$ the observed thinking time in seconds, and $c_n$ the pre-move
+clock. Let $k\in\{0,\ldots,K-1\}$ index the $K=16$ effort buckets.
+The joint model predicts
 
-```text
-p(m, k | x) = p(k | x) p(m | k, x)
-p(m | x) = sum_k p(k | x) p(m | k, x)
-```
+$$
+\begin{aligned}
+p_\theta(m,k\mid x)
+&=p_\theta(k\mid x)\,p_\theta(m\mid k,x),\\
+\pi_\theta^{\mathrm{mix}}(m\mid x)
+&=\sum_{k=0}^{K-1}p_\theta(k\mid x)\,p_\theta(m\mid k,x).
+\end{aligned}
+$$
 
-Each bucket's move distribution is normalized over legal moves before mixing.
+For the legal move set $\mathcal{L}(x)$, each bucket is normalized separately
+before mixing:
+
+$$
+p_\theta(m\mid k,x)
+=\frac{\exp s_{\theta,k}(m,x)}
+{\sum_{a\in\mathcal{L}(x)}\exp s_{\theta,k}(a,x)},
+\qquad m\in\mathcal{L}(x).
+$$
+
 A rank-16 residual conditions the existing policy head on effort; its gates
-start at zero. The shared trunk, value head, and effort head are retained. The
-ordinary move output is the predicted-effort marginal, never conditioned on the
-observed future thinking time. See [prototype details](docs/joint_move_time.md).
+start at zero. The shared trunk, value head, and effort head are retained.
+The independent-head baseline instead uses the ordinary legal policy
+$\pi_\theta^{\mathrm{ind}}(m\mid x)$, without the effort-conditioned residual.
+Both policies receive the same pre-move context. Observed moves and future
+thinking times are loss targets, not forward inputs. See
+[prototype details](docs/joint_move_time.md).
 
-The effort target is a smoothed histogram `q(k)` around
+### Effort targets and valid-label sets
 
-```text
-u = clip(log1p(ponder_seconds) / log1p(max(pre_move_clock, 1)), 0, 1)
-```
+The smoothed effort target $q_n(k)$ is centered on normalized effort
 
-The histogram uses 16 equal-width buckets and Gaussian smoothing with
-`sigma = 0.75 / 16`, renormalized over `[0, 1]`. Valid time supervision requires
-finite nonnegative `ponder`, finite `clk_left > 0.5`, finite `has_clock > 0.5`,
-and a finite positive position weight. Invalid time labels do not exclude an
-otherwise valid example from move supervision.
+$$
+u_n=\operatorname{clip}\!\left(
+\frac{\log(1+t_n)}{\log(1+\max(c_n,1))},\,0,\,1
+\right).
+$$
 
-Define the following losses, with position weights understood:
+Writing $\Phi$ for the standard normal CDF, the HL-Gauss histogram is
 
-| Symbol | Definition | Averaging denominator |
-| --- | --- | --- |
-| `M` | Human-move NLL, `-log p(m | x)` | All position weight |
-| `E` | Marginal effort CE, `-sum_k q(k) log p(k | x)` | Valid-clock position weight |
-| `C` | Posterior effort CE, `-sum_k q(k) log p(k | m, x)` | All position weight; invalid-clock rows contribute zero |
-| `V` | Three-class loss/draw/win cross-entropy | All position weight |
-| `R` | Observed next human move cross-entropy, in the opponent frame | Weight of rows with a valid `next_move` |
+$$
+\begin{aligned}
+b_k&=\frac{k}{K},\qquad \sigma=\frac{0.75}{K},\\
+h_{n,k}
+&=\Phi\!\left(\frac{b_{k+1}-u_n}{\sigma}\right)
+-\Phi\!\left(\frac{b_k-u_n}{\sigma}\right),\\
+q_n(k)&=\frac{h_{n,k}}
+{\max\!\left(\sum_{j=0}^{K-1}h_{n,j},10^{-8}\right)}.
+\end{aligned}
+$$
 
-The implementation floors training denominators at one. With ordinary unit
-weights these definitions are the usual means; an all-invalid time microbatch
-has zero time loss. The common supervised objective is `M + 0.10 V + 0.15 R`.
-These experiments do not use DPO.
+Valid time supervision requires finite nonnegative thinking time, a finite
+pre-move clock greater than 0.5 seconds, a finite clock-presence flag greater
+than 0.5, and a finite positive position weight. Invalid time labels do not
+exclude an otherwise valid example from move supervision.
+
+Let $\mathcal{B}$ be a training microbatch, $\mathcal{T}\subseteq\mathcal{B}$
+the valid-clock rows, and $\mathcal{S}\subseteq\mathcal{B}$ the rows with a valid
+next-move label. Let $w_n$ be the position weight after replacing nonfinite or
+nonpositive weights with zero. Define
+
+$$
+\begin{aligned}
+W&=\max\!\left(\sum_{n\in\mathcal{B}}w_n,1\right),\\
+W_{\mathcal{T}}&=\max\!\left(\sum_{n\in\mathcal{T}}w_n,1\right),\\
+W_{\mathcal{S}}&=\max\!\left(\sum_{n\in\mathcal{S}}w_n,1\right).
+\end{aligned}
+$$
+
+### Loss components
+
+The move loss for either legal policy $\pi$ is
+
+$$
+\mathcal{M}[\pi]
+=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n\log\pi(m_n\mid x_n).
+$$
+
+The marginal effort loss and posterior effort loss are
+
+$$
+\begin{aligned}
+\mathcal{E}
+&=-\frac{1}{W_{\mathcal{T}}}
+\sum_{n\in\mathcal{T}}w_n
+\sum_{k=0}^{K-1}q_n(k)\log p_\theta(k\mid x_n),\\
+\mathcal{C}
+&=-\frac{1}{W}
+\sum_{n\in\mathcal{T}}w_n
+\sum_{k=0}^{K-1}q_n(k)\log p_\theta(k\mid m_n,x_n),\\
+p_\theta(k\mid m_n,x_n)
+&=\frac{p_\theta(k\mid x_n)\,p_\theta(m_n\mid k,x_n)}
+{\pi_\theta^{\mathrm{mix}}(m_n\mid x_n)}.
+\end{aligned}
+$$
+
+The distinction between $W_{\mathcal{T}}$ and $W$ matters on mixed-clock
+microbatches. An empty $\mathcal{T}$ contributes zero to both time losses.
+
+Let $y_n\in\{\mathrm{loss},\mathrm{draw},\mathrm{win}\}$ be the outcome from
+the side-to-move perspective, and $r_n$ the actual next human move expressed
+in the opponent's frame. The shared auxiliary losses are
+
+$$
+\begin{aligned}
+\mathcal{V}
+&=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n
+\log p_\theta^{\mathrm{value}}(y_n\mid x_n),\\
+\mathcal{R}
+&=-\frac{1}{W_{\mathcal{S}}}\sum_{n\in\mathcal{S}}w_n
+\log p_\theta^{\mathrm{reply}}(r_n\mid x_n),\\
+\mathcal{A}&=0.10\,\mathcal{V}+0.15\,\mathcal{R}.
+\end{aligned}
+$$
+
+The reply distribution covers the full move vocabulary. The symbols
+$\mathcal{M},\mathcal{E},\mathcal{C},\mathcal{V},\mathcal{R}$ correspond to
+the shorthand M, E, C, V, and R used elsewhere in this document. These are
+zero-label-smoothing microbatch objectives; accumulation averages them as
+described in section 5. DPO has coefficient zero for every J0–J4 experiment.
 
 ## 2. Ablation matrix
 
@@ -57,11 +141,11 @@ batch size, and training budget. Change only the three settings below.
 
 | Run | Description | `model_overrides.use_joint_move_time` | `joint_time_coef` | `ponder_coef` | Total objective |
 | --- | --- | --- | --- | --- | --- |
-| **J0** | V2 baseline without time supervision | `false` | `0.0` | `0.0` | `M + 0.10 V + 0.15 R` |
-| **J1** | Independent move and effort heads | `false` | `0.0` | `1.0` | `M + E + 0.10 V + 0.15 R` |
-| **J2** | Effort-conditioned policy without time labels | `true` | `0.0` | `0.0` | `M + 0.10 V + 0.15 R` |
-| **J3** | Effort-conditioned policy with marginal effort supervision | `true` | `0.0` | `1.0` | `M + E + 0.10 V + 0.15 R` |
-| **J4** | Full joint move/effort objective | `true` | `1.0` | `0.0` | `M + C + 0.10 V + 0.15 R` |
+| **J0** | V2 baseline without time supervision | `false` | `0.0` | `0.0` | $\mathcal{M}[\pi_\theta^{\mathrm{ind}}]+\mathcal{A}$ |
+| **J1** | Independent move and effort heads | `false` | `0.0` | `1.0` | $\mathcal{M}[\pi_\theta^{\mathrm{ind}}]+\mathcal{E}+\mathcal{A}$ |
+| **J2** | Effort-conditioned policy without time labels | `true` | `0.0` | `0.0` | $\mathcal{M}[\pi_\theta^{\mathrm{mix}}]+\mathcal{A}$ |
+| **J3** | Effort-conditioned policy with marginal effort supervision | `true` | `0.0` | `1.0` | $\mathcal{M}[\pi_\theta^{\mathrm{mix}}]+\mathcal{E}+\mathcal{A}$ |
+| **J4** | Full joint move/effort objective | `true` | `1.0` | `0.0` | $\mathcal{M}[\pi_\theta^{\mathrm{mix}}]+\mathcal{C}+\mathcal{A}$ |
 
 J0 and J1 retain the existing effort head and pre-move clock inputs; disabling
 time supervision does not remove clock context. J2's effort prior is learned
@@ -70,6 +154,108 @@ meaning. J3 couples the move policy to effort while retaining separate move and
 marginal-effort losses. At zero label smoothing and on valid-clock rows, J4's
 `M + C` equals the smoothed joint NLL. This identity applies to those two terms,
 not to the additional value/reply losses.
+
+### J0: Independent policy without time supervision
+
+$$
+\boxed{
+\mathcal{L}_{\mathrm{J0}}(\theta)
+=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n
+\log\pi_\theta^{\mathrm{ind}}(m_n\mid x_n)
++\mathcal{A}
+}
+$$
+
+The effort head receives no explicit effort-target loss and does not enter
+the move policy. Pre-move clock features remain available to the shared trunk.
+
+### J1: Independent move and effort supervision
+
+The model represents conditional independence of move and effort given context:
+
+$$
+p_\theta^{\mathrm{ind}}(m,k\mid x)
+=\pi_\theta^{\mathrm{ind}}(m\mid x)\,p_\theta(k\mid x).
+$$
+
+$$
+\boxed{
+\mathcal{L}_{\mathrm{J1}}(\theta)
+=\mathcal{M}[\pi_\theta^{\mathrm{ind}}]+\mathcal{E}+\mathcal{A}
+}
+$$
+
+Both heads share the trunk. The move head does not take an effort bucket as
+input. On fully clock-labeled microbatches, the move and effort terms equal
+the smoothed NLL of this independent joint distribution.
+
+### J2: Latent effort-conditioned policy
+
+$$
+\boxed{
+\mathcal{L}_{\mathrm{J2}}(\theta)
+=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n
+\log\!\left[
+\sum_{k=0}^{K-1}p_\theta(k\mid x_n)\,p_\theta(m_n\mid k,x_n)
+\right]+\mathcal{A}
+}
+$$
+
+The buckets act as latent mixture components, with no loss assigning them the
+observed thinking-time meaning. This isolates capacity and mixture effects.
+
+### J3: Effort-conditioned policy with marginal effort supervision
+
+$$
+\boxed{
+\mathcal{L}_{\mathrm{J3}}(\theta)
+=\mathcal{M}[\pi_\theta^{\mathrm{mix}}]
++\mathcal{E}+\mathcal{A}
+}
+$$
+
+Move prediction uses the effort mixture, while the time target supervises the
+marginal $p_\theta(k\mid x)$. This does not generally equal the joint NLL of
+$p_\theta(m,k\mid x)$ because it lacks the move-conditioned effort term.
+
+### J4: Joint move and thinking-time supervision
+
+$$
+\boxed{
+\mathcal{L}_{\mathrm{J4}}(\theta)
+=\mathcal{M}[\pi_\theta^{\mathrm{mix}}]
++\mathcal{C}+\mathcal{A}
+}
+$$
+
+For each valid-clock example, Bayes' rule gives the joint-loss identity:
+
+$$
+\begin{aligned}
+&-\log\pi_\theta^{\mathrm{mix}}(m_n\mid x_n)
+-\sum_{k=0}^{K-1}q_n(k)\log p_\theta(k\mid m_n,x_n)\\
+&\qquad=-\sum_{k=0}^{K-1}q_n(k)\log p_\theta(m_n,k\mid x_n).
+\end{aligned}
+$$
+
+Consequently, the exact mixed-clock microbatch objective is
+
+$$
+\boxed{
+\begin{aligned}
+\mathcal{L}_{\mathrm{J4}}(\theta)
+=-\frac{1}{W}\Bigg[
+&\sum_{n\in\mathcal{T}}w_n
+\sum_{k=0}^{K-1}q_n(k)\log p_\theta(m_n,k\mid x_n)\\
++&\sum_{n\in\mathcal{B}\setminus\mathcal{T}}w_n
+\log\pi_\theta^{\mathrm{mix}}(m_n\mid x_n)
+\Bigg]+\mathcal{A}.
+\end{aligned}
+}
+$$
+
+Clock-labeled rows optimize smoothed joint likelihood; other rows optimize
+marginal move likelihood. Observed thinking time is used only as a loss target.
 
 ### Questions answered by each comparison
 
@@ -155,39 +341,32 @@ dataset prepared with a lower cutoff is needed for that extension.
 
 ## 4. Launching J0–J4 and tracking runs
 
-Run the following from the repository root. Select `ABLATION` and `SEED`; the
-case statement sets the three ablation-specific overrides. This block starts one
-run, not all five.
+Run these commands from the repository root (`/home/chessforge`). Each block
+launches one seed-42 experiment with the local Pool B training/validation data,
+a distinct workdir, and an explicit Trackio run name. On a single L4, run one
+experiment at a time; wait for it to finish before launching the next. If J0 is
+already running or complete, continue with J1 instead of starting a second J0.
+
+### J0: V2 baseline without time supervision
 
 ```bash
 export TRACKIO_DIR="$PWD/trackio_logs"
-ABLATION=J0
-SEED=42
-
-case "$ABLATION" in
-  J0) USE_JOINT=false; JOINT_COEF=0.0; PONDER_COEF=0.0 ;;
-  J1) USE_JOINT=false; JOINT_COEF=0.0; PONDER_COEF=1.0 ;;
-  J2) USE_JOINT=true;  JOINT_COEF=0.0; PONDER_COEF=0.0 ;;
-  J3) USE_JOINT=true;  JOINT_COEF=0.0; PONDER_COEF=1.0 ;;
-  J4) USE_JOINT=true;  JOINT_COEF=1.0; PONDER_COEF=0.0 ;;
-  *) echo "Choose J0, J1, J2, J3, or J4"; exit 1 ;;
-esac
 
 .venv/bin/python -m chessforge.cli.train \
   --config configs/chessforge_joint_time_28m.yaml \
   --set \
-    workdir="$PWD/runs/${ABLATION}_s${SEED}" \
+    workdir="$PWD/runs/J0_s42" \
     trackio_project=chessforge \
-    trackio_run_name="${ABLATION}_s${SEED}" \
+    trackio_run_name=J0_s42 \
     trackio_group=joint_move_time_ablations \
     trackio_space_id=geekyrakshit/chessforge-tracking \
-    model_overrides.use_joint_move_time="$USE_JOINT" \
+    model_overrides.use_joint_move_time=false \
     model_overrides.joint_move_time_rank=16 \
     model_overrides.ponder_buckets=16 \
-    joint_time_coef="$JOINT_COEF" \
-    ponder_coef="$PONDER_COEF" \
-    seed="$SEED" \
-    data.shuffle_seed="$SEED" \
+    joint_time_coef=0.0 \
+    ponder_coef=0.0 \
+    seed=42 \
+    data.shuffle_seed=42 \
     data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
     data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
     'data.test_glob=""' \
@@ -206,10 +385,165 @@ esac
     ckpt_every=1000
 ```
 
+### J1: Independent move and effort heads
+
+```bash
+export TRACKIO_DIR="$PWD/trackio_logs"
+
+.venv/bin/python -m chessforge.cli.train \
+  --config configs/chessforge_joint_time_28m.yaml \
+  --set \
+    workdir="$PWD/runs/J1_s42" \
+    trackio_project=chessforge \
+    trackio_run_name=J1_s42 \
+    trackio_group=joint_move_time_ablations \
+    trackio_space_id=geekyrakshit/chessforge-tracking \
+    model_overrides.use_joint_move_time=false \
+    model_overrides.joint_move_time_rank=16 \
+    model_overrides.ponder_buckets=16 \
+    joint_time_coef=0.0 \
+    ponder_coef=1.0 \
+    seed=42 \
+    data.shuffle_seed=42 \
+    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
+    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
+    'data.test_glob=""' \
+    'data.anneal_glob=""' \
+    data.global_batch_size=1024 \
+    data.eval_batch_size=64 \
+    data.val_batches=50 \
+    optim.total_steps=10000 \
+    optim.grad_accum_steps=16 \
+    value_coef=0.10 \
+    reply_coef=0.15 \
+    label_smoothing=0.0 \
+    dpo_coef=0.0 \
+    log_every=100 \
+    eval_every=1000 \
+    ckpt_every=1000
+```
+
+### J2: Effort-conditioned policy without time labels
+
+```bash
+export TRACKIO_DIR="$PWD/trackio_logs"
+
+.venv/bin/python -m chessforge.cli.train \
+  --config configs/chessforge_joint_time_28m.yaml \
+  --set \
+    workdir="$PWD/runs/J2_s42" \
+    trackio_project=chessforge \
+    trackio_run_name=J2_s42 \
+    trackio_group=joint_move_time_ablations \
+    trackio_space_id=geekyrakshit/chessforge-tracking \
+    model_overrides.use_joint_move_time=true \
+    model_overrides.joint_move_time_rank=16 \
+    model_overrides.ponder_buckets=16 \
+    joint_time_coef=0.0 \
+    ponder_coef=0.0 \
+    seed=42 \
+    data.shuffle_seed=42 \
+    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
+    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
+    'data.test_glob=""' \
+    'data.anneal_glob=""' \
+    data.global_batch_size=1024 \
+    data.eval_batch_size=64 \
+    data.val_batches=50 \
+    optim.total_steps=10000 \
+    optim.grad_accum_steps=16 \
+    value_coef=0.10 \
+    reply_coef=0.15 \
+    label_smoothing=0.0 \
+    dpo_coef=0.0 \
+    log_every=100 \
+    eval_every=1000 \
+    ckpt_every=1000
+```
+
+### J3: Effort-conditioned policy with marginal effort supervision
+
+```bash
+export TRACKIO_DIR="$PWD/trackio_logs"
+
+.venv/bin/python -m chessforge.cli.train \
+  --config configs/chessforge_joint_time_28m.yaml \
+  --set \
+    workdir="$PWD/runs/J3_s42" \
+    trackio_project=chessforge \
+    trackio_run_name=J3_s42 \
+    trackio_group=joint_move_time_ablations \
+    trackio_space_id=geekyrakshit/chessforge-tracking \
+    model_overrides.use_joint_move_time=true \
+    model_overrides.joint_move_time_rank=16 \
+    model_overrides.ponder_buckets=16 \
+    joint_time_coef=0.0 \
+    ponder_coef=1.0 \
+    seed=42 \
+    data.shuffle_seed=42 \
+    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
+    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
+    'data.test_glob=""' \
+    'data.anneal_glob=""' \
+    data.global_batch_size=1024 \
+    data.eval_batch_size=64 \
+    data.val_batches=50 \
+    optim.total_steps=10000 \
+    optim.grad_accum_steps=16 \
+    value_coef=0.10 \
+    reply_coef=0.15 \
+    label_smoothing=0.0 \
+    dpo_coef=0.0 \
+    log_every=100 \
+    eval_every=1000 \
+    ckpt_every=1000
+```
+
+### J4: Full joint move/effort objective
+
+```bash
+export TRACKIO_DIR="$PWD/trackio_logs"
+
+.venv/bin/python -m chessforge.cli.train \
+  --config configs/chessforge_joint_time_28m.yaml \
+  --set \
+    workdir="$PWD/runs/J4_s42" \
+    trackio_project=chessforge \
+    trackio_run_name=J4_s42 \
+    trackio_group=joint_move_time_ablations \
+    trackio_space_id=geekyrakshit/chessforge-tracking \
+    model_overrides.use_joint_move_time=true \
+    model_overrides.joint_move_time_rank=16 \
+    model_overrides.ponder_buckets=16 \
+    joint_time_coef=1.0 \
+    ponder_coef=0.0 \
+    seed=42 \
+    data.shuffle_seed=42 \
+    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
+    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
+    'data.test_glob=""' \
+    'data.anneal_glob=""' \
+    data.global_batch_size=1024 \
+    data.eval_batch_size=64 \
+    data.val_batches=50 \
+    optim.total_steps=10000 \
+    optim.grad_accum_steps=16 \
+    value_coef=0.10 \
+    reply_coef=0.15 \
+    label_smoothing=0.0 \
+    dpo_coef=0.0 \
+    log_every=100 \
+    eval_every=1000 \
+    ckpt_every=1000
+```
+
+For seed 43 or 44, change `seed`, `data.shuffle_seed`, the `_s42` workdir suffix,
+and the `_s42` Trackio run-name suffix together. Keep every other setting fixed.
+
 The saved J0 config at `runs/J0_s42/config.json` records project `chessforge`,
 run name `J0`, group `joint_move_time_ablations`, and Space
 [`geekyrakshit/chessforge-tracking`](https://huggingface.co/spaces/geekyrakshit/chessforge-tracking).
-The command above uses seed-qualified run names for future launches. The current
+The commands above use seed-qualified run names for future launches. The current
 `run.sh` repeats tracking overrides; the last occurrence wins, explaining why
 the saved run is named `J0` rather than `J0_s42`. Preserve the saved config as the
 record of what that run actually used.

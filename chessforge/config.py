@@ -126,7 +126,10 @@ class TrainConfig:
     test_every: int = 50_000
     ckpt_every: int = 10_000
     keep_checkpoints: int = 3
-    wandb_project: str = ""
+    trackio_project: str = ""  # empty disables experiment tracking
+    trackio_run_name: str | None = None  # falls back to the model name
+    trackio_group: str | None = None  # group related runs, e.g. ablation seeds
+    trackio_space_id: str | None = None  # optional Hugging Face Space
 
 
 def _from_dict(cls, d: dict[str, Any]):

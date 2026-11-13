@@ -369,63 +369,75 @@ class Trainer:
             f"{o.total_steps * d.global_batch_size / max(n_total, 1):.2f} epochs"
         )
 
-        wandb = None
-        if cfg.wandb_project and jax.process_index() == 0:
-            import wandb as _wandb
+        tracking_run = None
+        if cfg.trackio_project and jax.process_index() == 0:
+            import trackio
 
-            wandb = _wandb
-            wandb.init(
-                project=cfg.wandb_project,
+            tracking_run = trackio.init(
+                project=cfg.trackio_project,
+                space_id=cfg.trackio_space_id,
                 config=config_to_dict(cfg),
-                name=self.model_cfg.name,
+                name=cfg.trackio_run_name or self.model_cfg.name,
+                group=cfg.trackio_group,
+                embed=False,
             )
 
-        base_rng = jax.device_put(jax.random.PRNGKey(cfg.seed + 1), self.repl)
-        acc, n_acc, t0 = None, 0, time.time()
-        while step < o.total_steps:
-            if not in_anneal and step >= anneal_step and d.anneal_glob:
-                log0(
-                    f"[curriculum] step {step}: switching to anneal_glob={d.anneal_glob}"
-                )
-                train_it, _ = pipeline.make_train_iterator(
-                    d,
-                    self.model_cfg.history,
-                    pattern=d.anneal_glob,
-                    seed=d.shuffle_seed + 99991,
-                )
-                in_anneal = True
-
-            batch = self.to_global(next(train_it))
-            state, metrics = self.p_train_step(state, self.ref_params, batch, base_rng)
-            step += 1
-            acc = metrics if acc is None else self.p_add(acc, metrics)
-            n_acc += 1
-
-            if step % cfg.log_every == 0:
-                m = summarize_train_metrics(jax.device_get(acc), n_acc)
-                dt = time.time() - t0
-                m["positions_per_sec"] = n_acc * d.global_batch_size / max(dt, 1e-6)
-                log0(f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items()))
-                if wandb:
-                    wandb.log({f"train/{k}": v for k, v in m.items()}, step=step)
-                acc, n_acc, t0 = None, 0, time.time()
-
-            last = step == o.total_steps
-            if d.val_glob and (step % cfg.eval_every == 0 or last):
-                r = self.evaluate(state.params, d.val_glob, d.val_batches)
-                log0(f"[val] step {step} {json.dumps(r['overall'])}")
-                if wandb:
-                    wandb.log(
-                        {f"val/{k}": v for k, v in r["overall"].items()}, step=step
+        try:
+            base_rng = jax.device_put(jax.random.PRNGKey(cfg.seed + 1), self.repl)
+            acc, n_acc, t0 = None, 0, time.time()
+            while step < o.total_steps:
+                if not in_anneal and step >= anneal_step and d.anneal_glob:
+                    log0(
+                        f"[curriculum] step {step}: switching to anneal_glob={d.anneal_glob}"
                     )
-            if d.test_glob and (step % cfg.test_every == 0 or last):
-                r = self.evaluate(state.params, d.test_glob)
-                log0(f"[test] step {step} {json.dumps(r['overall'])}")
-                if wandb:
-                    wandb.log(
-                        {f"test/{k}": v for k, v in r["overall"].items()}, step=step
+                    train_it, _ = pipeline.make_train_iterator(
+                        d,
+                        self.model_cfg.history,
+                        pattern=d.anneal_glob,
+                        seed=d.shuffle_seed + 99991,
                     )
-            if step % cfg.ckpt_every == 0 or last:
-                self.save(state, train_it)
-        self.ckpt.wait_until_finished()
-        return state
+                    in_anneal = True
+
+                batch = self.to_global(next(train_it))
+                state, metrics = self.p_train_step(
+                    state, self.ref_params, batch, base_rng
+                )
+                step += 1
+                acc = metrics if acc is None else self.p_add(acc, metrics)
+                n_acc += 1
+
+                if step % cfg.log_every == 0:
+                    m = summarize_train_metrics(jax.device_get(acc), n_acc)
+                    dt = time.time() - t0
+                    m["positions_per_sec"] = n_acc * d.global_batch_size / max(dt, 1e-6)
+                    log0(
+                        f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items())
+                    )
+                    if tracking_run is not None:
+                        tracking_run.log(
+                            {f"train/{k}": v for k, v in m.items()}, step=step
+                        )
+                    acc, n_acc, t0 = None, 0, time.time()
+
+                last = step == o.total_steps
+                if d.val_glob and (step % cfg.eval_every == 0 or last):
+                    r = self.evaluate(state.params, d.val_glob, d.val_batches)
+                    log0(f"[val] step {step} {json.dumps(r['overall'])}")
+                    if tracking_run is not None:
+                        tracking_run.log(
+                            {f"val/{k}": v for k, v in r["overall"].items()}, step=step
+                        )
+                if d.test_glob and (step % cfg.test_every == 0 or last):
+                    r = self.evaluate(state.params, d.test_glob)
+                    log0(f"[test] step {step} {json.dumps(r['overall'])}")
+                    if tracking_run is not None:
+                        tracking_run.log(
+                            {f"test/{k}": v for k, v in r["overall"].items()}, step=step
+                        )
+                if step % cfg.ckpt_every == 0 or last:
+                    self.save(state, train_it)
+            self.ckpt.wait_until_finished()
+            return state
+        finally:
+            if tracking_run is not None:
+                tracking_run.finish()

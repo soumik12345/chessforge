@@ -1,4 +1,8 @@
 model: chessforge-v2-28m
+trackio_project: ""  # set to enable experiment tracking
+trackio_run_name: null  # defaults to the model name
+trackio_group: null
+trackio_space_id: null
 model_overrides:
   compute_dtype: bfloat16
   remat_blocks: true          # fits BS=1024-2048 on a single 16GB v5e-1 or GPU; set false on v6e-1/8xGPU

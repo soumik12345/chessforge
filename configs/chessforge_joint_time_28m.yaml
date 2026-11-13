@@ -1,5 +1,9 @@
 # Opt-in joint move/effort prototype. Train a fresh joint checkpoint.
 model: chessforge-v2-28m
+trackio_project: ""  # set to enable experiment tracking
+trackio_run_name: null  # defaults to the model name
+trackio_group: null
+trackio_space_id: null
 model_overrides:
   compute_dtype: bfloat16
   remat_blocks: true

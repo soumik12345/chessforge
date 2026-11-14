@@ -4,8 +4,11 @@ This study tests whether modeling the relationship between human moves and
 thinking time improves held-out move prediction beyond an independent effort
 head or extra policy capacity. It follows the fixed-update, fixed-example
 approach of the earlier [R1–R6 ablations](https://github.com/soumik12345/chessforge/blob/improvement-ablations/EXPERIMENTS.md#52-controlled-compute-matched-ablation-ladder-r1r6).
-The definitions below describe the current implementation; they are not claims
-of measured improvement. No completed J0–J4 results are recorded here yet.
+The definitions below describe the current implementation. Completed seed-42
+J0–J3 validation results are recorded in [section 7](#7-j0j3-validation-results-seed-42).
+J3 has the lowest final move NLL, while J1 has the highest top-1 accuracy;
+the single-seed validation comparison does not establish a decisive winner.
+J4 and held-out titled-online/OTB results remain unreported here.
 
 ## 1. Model and objectives
 
@@ -800,7 +803,144 @@ separate names and keep the curriculum identical across variants. That is a
 separate experiment from J0–J4 above; clockless OTB rows reintroduce the effort-loss
 weighting difference described in section 3.
 
-### Results template
+## 7. J0–J3 validation results (seed 42)
+
+### Source and comparison scope
+
+These results were retrieved on **2026-11-14** from project `chessforge` in
+[`geekyrakshit/chessforge-tracking`](https://geekyrakshit-chessforge-tracking.hf.space).
+The source runs are identified below; the two `J0-checkpoint-export` runs are
+excluded.
+
+| Variant | Trackio run name | Trackio run ID |
+| --- | --- | --- |
+| J0 | `J0` | `cca3cd3d7b8b46b7b0852c3f2aa35b49` |
+| J1 | `J1_s42` | `b2c1dac4599e4a56ac6a21f864570ca5` |
+| J2 | `J2_s42` | `3c9a8300495d46d7866f95ca61e80619` |
+| J3 | `J3_s42` | `8b526994caa541f0ba67891c5e435e9e` |
+
+The Space's read API at retrieval time used POST requests to
+`/api/get_runs_for_project` and `/api/get_run_configs` with
+`{"project": "chessforge"}`, and `/api/get_logs` and `/api/get_run_summary` with
+the same project plus `run` and `run_id` from the table. Each run returned
+**100 training records and 10 validation records**, ending at update 10,000.
+
+The recorded configurations match the shared protocol in section 3: seed and
+shuffle seed 42, batch size 1,024, accumulation 16, and 10,000 optimizer updates
+(10.24M position presentations). All use the same Pool B titled June 2025
+training and validation paths. Each validation pass reports **3,200 positions**
+(`val_batches=50`, `eval_batch_size=64`), rather than the full 7,774-position
+validation split. No `test/` metrics appear in these runs, and `test_glob` is
+empty. These tables therefore report training-time validation, not the separate
+held-out titled-online or OTB evaluations. Matching paths and configurations do
+not verify dataset content hashes or training code revisions, which were not
+recorded in the retrieved configurations.
+
+### Final checkpoint metrics
+
+All entries below use update **10,000**, not separately selected best checkpoints.
+Move NLL is derived as `ln(val/perplexity)` using unrounded values. NLL and entropy
+are in nats; accuracies are percentages. Move top-1 and top-3 use legality masking.
+
+| Variant | Effort-conditioned policy | Time supervision | Move NLL ↓ | Perplexity ↓ | Move top-1 ↑ | Move top-3 ↑ |
+| --- | --- | --- | --- | --- | --- | --- |
+| J0 | No | No | 1.39364 | 4.02948 | 54.500% | **82.719%** |
+| J1 | No | Marginal effort | 1.39826 | 4.04813 | **55.344%** | 81.375% |
+| J2 | Yes | No | 1.40150 | 4.06130 | 55.313% | 81.906% |
+| J3 | Yes | Marginal effort | **1.38112** | **3.97937** | 54.719% | **82.719%** |
+
+J0 and J2 still receive pre-move clock context; they lack time supervision, not
+clock inputs. Total training loss is not comparable across these objectives.
+
+| Variant | Value NLL ↓ | Value accuracy ↑ | Policy entropy | Unmasked move accuracy ↑ | Joint NLL ↓ | Effort-given-move NLL ↓ |
+| --- | --- | --- | --- | --- | --- | --- |
+| J0 | 0.70243 | 64.531% | 1.28800 | 2.969% | Not emitted | Not emitted |
+| J1 | **0.69556** | 64.562% | 1.28353 | **4.938%** | Not emitted | Not emitted |
+| J2 | 0.70400 | 64.375% | 1.29379 | 3.438% | 5.08869 | 3.68718 |
+| J3 | 0.69783 | **64.844%** | 1.28901 | 3.250% | 3.39583 | 2.01471 |
+
+Unmasked move accuracy is a human-move matching diagnostic over the full
+vocabulary, not legality rate. The much higher legal-masked accuracies above
+should not be interpreted as unmasked policy performance. Entropy has no
+universally preferred direction.
+
+### Ablation comparisons
+
+Differences are candidate minus reference, computed before rounding. Negative
+NLL or perplexity changes are improvements; positive accuracy changes are
+improvements. Accuracy differences use percentage points (pp).
+
+| Comparison | Move NLL change | Perplexity change | Top-1 change (pp) | Top-3 change (pp) |
+| --- | --- | --- | --- | --- |
+| J1 − J0 | +0.00462 | +0.463% | +0.844 | −1.344 |
+| J2 − J0 | +0.00787 | +0.790% | +0.812 | −0.812 |
+| J3 − J1 | −0.01713 | −1.699% | −0.625 | +1.344 |
+| J3 − J2 | −0.02038 | −2.017% | −0.594 | +0.812 |
+| J3 − J0 | −0.01251 | −1.244% | +0.219 | 0.000 |
+
+- **Time supervision alone (J1 vs. J0):** top-1 improves, but move NLL and top-3
+  worsen. The independent auxiliary effort task does not yield a consistent
+  improvement in move prediction in this run.
+- **Conditioning alone (J2 vs. J0):** top-1 improves, but move NLL and top-3
+  worsen. Additional conditional capacity without time labels does not improve
+  the primary probabilistic score at this budget.
+- **Conditioning with supervision (J3 vs. J1):** move NLL and top-3 improve,
+  while top-1 falls. This favors J3 for distribution quality, not for every
+  move-matching metric.
+- **Combined effect (J3 vs. J0):** perplexity improves 1.244%, top-3 ties, and
+  top-1 gains only seven human-move matches out of 3,200. The pattern suggests
+  that conditioning and supervision work better together, but requires
+  replication before attributing a reliable benefit to their interaction.
+
+### Learning dynamics and time prediction
+
+J3 has the lowest move NLL at every recorded checkpoint from update 6,000 through
+10,000. Its late advantage is therefore not confined to the final observation.
+All four runs attain their lowest recorded validation NLL at update 10,000.
+
+| Update | J0 move NLL | J1 move NLL | J2 move NLL | J3 move NLL |
+| --- | --- | --- | --- | --- |
+| 6,000 | 1.50206 | 1.50144 | 1.48950 | **1.48781** |
+| 7,000 | 1.48361 | 1.46987 | 1.47313 | **1.46395** |
+| 8,000 | 1.47249 | 1.47055 | 1.47655 | **1.46252** |
+| 9,000 | 1.44216 | 1.44612 | 1.44008 | **1.42409** |
+| 10,000 | 1.39364 | 1.39826 | 1.40150 | **1.38112** |
+
+NLL improves by 0.07230–0.08139 nats across variants during the final 2,000
+updates, which coincide with learning-rate decay. These results establish
+performance at the fixed training budget, not convergence.
+
+J2 and J3 both report valid time weight 3,200 on every validation pass. J3's final
+effort-given-move NLL of 2.01471 is lower than J2's 3.68718, but J2's latent buckets
+were never supervised to represent observed time. This comparison supports the
+benefit of time labels; it does not establish that conditioning outperforms an
+independent supervised time head. J1 has no comparable held-out time score.
+Its final logging-window marginal effort loss is almost identical to J3's
+(1.99213 vs. 1.99210), and training loss is not a substitute for that missing
+evaluation. J3 uses `joint_time_coef=0`; posterior effort supervision remains
+the separate J4 experiment. None of these bucket scores measures seconds error
+or time calibration.
+
+### Interpretation and next experiments
+
+**J3 is the candidate to carry forward for probabilistic human-move modeling;
+J1 leads top-1 accuracy.** Retain J0 and J1 as controls. This is a single-seed,
+limited-validation comparison, with no evidence here for superiority in playing
+strength or generalization to OTB games. The logged per-run accuracy intervals
+have approximately ±1.72 percentage-point half-widths, assume independent
+positions, and are not paired intervals for differences between models.
+Aggregate logs cannot establish statistical significance across games or seeds.
+
+Before declaring an improvement:
+
+1. Evaluate the full validation split and the separate held-out titled-online
+   and OTB splits, preserving the final-checkpoint comparison.
+2. Repeat matched seeds 43 and 44; retain per-example predictions and game IDs
+   for paired, game-level comparisons as well as across-seed summaries.
+3. Add a common held-out marginal-effort score for J1 and J3, then run J4 to test
+   whether posterior supervision improves on marginal supervision.
+
+### Held-out results template
 
 Record one row per variant, seed, and evaluation split. Dashes mean not yet
 reported, not zero. Keep raw JSON beside the table and add across-seed summaries

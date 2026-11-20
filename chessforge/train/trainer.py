@@ -65,6 +65,13 @@ class Trainer:
         self.model_cfg = build_model_config(cfg.model, cfg.model_overrides)
         if cfg.joint_time_coef < 0:
             raise ValueError("joint_time_coef must be nonnegative")
+        if (
+            self.model_cfg.use_joint_move_time
+            and self.model_cfg.arch != "chessformer_v2"
+        ):
+            raise ValueError(
+                "use_joint_move_time=true is only supported for chessformer_v2"
+            )
         if cfg.joint_time_coef > 0 and not (
             self.model_cfg.arch == "chessformer_v2"
             and self.model_cfg.use_joint_move_time

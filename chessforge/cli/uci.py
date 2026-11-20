@@ -135,9 +135,12 @@ class ChessforgeUCIEngine:
             "oppo_elo": np.asarray([oppo_elo], np.float32),
             "clk_left": np.asarray([clk_self], np.float32),
         }
-        if self.model_cfg.use_joint_move_time:
+        if (
+            self.model_cfg.arch == "chessformer_v2"
+            and self.model_cfg.use_joint_move_time
+        ):
             legal = np.zeros((1, cu.VOCAB_SIZE), dtype=bool)
-            legal[0, cu.legal_move_indices(board)] = True
+            legal[0, cu.legal_move_indices(board).astype(np.intp)] = True
             batch["legal"] = legal
         return batch
 
@@ -196,7 +199,11 @@ class ChessforgeUCIEngine:
         )
         lm, _, _, aux = self._infer(self.params, batch)
         logits = np.asarray(lm[0], dtype=np.float64)
-        effort = float(np.asarray(aux["ponder_effort"][0])) if "ponder_effort" in aux else 0.25
+        effort = (
+            float(np.asarray(aux["ponder_effort"][0]))
+            if "ponder_effort" in aux
+            else 0.25
+        )
 
         mask = np.zeros(cu.VOCAB_SIZE, dtype=bool)
         mask[leg_idx.astype(np.int64)] = True
@@ -272,7 +279,9 @@ class ChessforgeUCIEngine:
                 if c["prob"] >= self.min_p * best_p
                 and (best_exp - c["score_exp"]) <= self.max_wdl_drop
             ] or [cands[0]]
-            v_logits = np.array([logits[c["idx"]] / temp for c in viable], dtype=np.float64)
+            v_logits = np.array(
+                [logits[c["idx"]] / temp for c in viable], dtype=np.float64
+            )
             vp = np.exp(v_logits - np.max(v_logits))
             vp /= vp.sum()
             chosen = viable[int(self.rng.choice(len(viable), p=vp))]["move"]
@@ -365,9 +374,15 @@ class ChessforgeUCIEngine:
             if line == "uci":
                 print("id name ChessForge-Master")
                 print("id author ChessForge")
-                print(f"option name Elo type spin default {int(self.self_elo)} min 400 max 3400")
-                print(f"option name SelfElo type spin default {int(self.self_elo)} min 400 max 3400")
-                print(f"option name OppoElo type spin default {int(self.oppo_elo)} min 400 max 3400")
+                print(
+                    f"option name Elo type spin default {int(self.self_elo)} min 400 max 3400"
+                )
+                print(
+                    f"option name SelfElo type spin default {int(self.self_elo)} min 400 max 3400"
+                )
+                print(
+                    f"option name OppoElo type spin default {int(self.oppo_elo)} min 400 max 3400"
+                )
                 print("option name Title type string default GM")
                 print("option name Format type string default otb")
                 print(f"option name Temperature type string default {self.temperature}")
@@ -413,7 +428,9 @@ def main():
     ap.add_argument("--config", help="Path to training YAML config")
     ap.add_argument("--set", nargs="*", default=[])
     ap.add_argument("--step", type=int, default=None)
-    ap.add_argument("--released", default="maia3-5m", help="Fallback if --config omitted")
+    ap.add_argument(
+        "--released", default="maia3-5m", help="Fallback if --config omitted"
+    )
     ap.add_argument("--elo", type=float, default=2550.0)
     ap.add_argument("--title", default="GM", help="GM|IM|FM|CM|NM|NONE")
     ap.add_argument("--format", default="otb", choices=["blitz", "rapid", "otb"])

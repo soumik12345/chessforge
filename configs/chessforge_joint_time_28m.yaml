@@ -1,4 +1,6 @@
-# Opt-in joint move/effort prototype. Train a fresh joint checkpoint.
+# Optional ablation of configs/chessforge_master_28m.yaml enabling joint
+# move/effort prediction. Train into a fresh workdir; default SFT/DPO/UCI
+# runs remain completely unaffected when use_joint_move_time is false.
 model: chessforge-v2-28m
 model_overrides:
   compute_dtype: bfloat16
@@ -8,6 +10,8 @@ model_overrides:
 workdir: /tmp/chessforge_runs/joint_time_28m
 data:
   train_glob: /mnt/maia3data/mix_1800plus_titled_otb/*/train/*.array_record
+  anneal_glob: /mnt/maia3data/pure_titled_and_otb/*/train/*.array_record
+  anneal_start_frac: 0.80
   val_glob: /mnt/maia3data/pure_titled_and_otb/*/val/*.array_record
   test_glob: /mnt/maia3data/eval_titled_antisf/*.array_record
   local_cache_dir: /tmp/chessforge_shard_cache

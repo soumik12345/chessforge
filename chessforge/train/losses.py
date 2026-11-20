@@ -243,6 +243,7 @@ def maia3_loss(
                 masked, _ = joint_move_log_probs(
                     aux["ponder_logits"], aux["conditional_move_logits"], batch["legal"]
                 )
+            masked = jnp.where(batch["legal"], masked, -jnp.inf)
         else:
             masked = jnp.where(batch["legal"], logits_move_f32, -jnp.inf)
         metrics["policy_acc_legal"] = (

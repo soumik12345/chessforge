@@ -9,19 +9,27 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from chessforge.models import forward_model
+from chessforge.models import ChessformerV2, forward_model
+from chessforge.models.joint_time import joint_move_log_probs
+from chessforge.train.losses import joint_time_nll_sums
 
 NUM_RATING_BINS = 32  # round(game_elo / 100), clipped
 
 
-def make_eval_step(graphdef: nnx.GraphDef, data_sharding, repl, sf_max_cp_loss: float = 35.0):
+def make_eval_step(
+    graphdef: nnx.GraphDef, data_sharding, repl, sf_max_cp_loss: float = 35.0
+):
     def step(params: nnx.State, batch: dict):
         model = nnx.merge(graphdef, params)
-        lm, lv, _ = forward_model(model, batch, deterministic=True, return_aux=False)
+        joint = isinstance(model, ChessformerV2) and model.cfg.use_joint_move_time
+        outputs = forward_model(model, batch, deterministic=True, return_aux=joint)
+        lm, lv, _ = outputs[:3]
         lm = lm.astype(jnp.float32)
         lv = lv.astype(jnp.float32)
 
         w = batch["weight"]
+        if joint:
+            w = jnp.where(jnp.isfinite(w) & (w > 0), w, 0.0)
         legal = batch["legal"] | (w[:, None] == 0)
         masked = jnp.where(legal, lm, -jnp.inf)
         logp = jax.nn.log_softmax(masked, axis=-1)
@@ -36,7 +44,29 @@ def make_eval_step(graphdef: nnx.GraphDef, data_sharding, repl, sf_max_cp_loss: 
         correct_top3 = (
             jnp.any(top3 == batch["move"][:, None], axis=-1).astype(jnp.float32) * w
         )
-        correct_unmasked = (jnp.argmax(lm, -1) == batch["move"]).astype(jnp.float32) * w
+        unmasked = lm
+        joint_metrics = {}
+        if joint:
+            aux = outputs[3]
+            # The joint forward pass returns a legally normalized mixture.
+            # Recover the truly unmasked mixture for the existing diagnostic.
+            unmasked, _ = joint_move_log_probs(
+                aux["ponder_logits"], aux["conditional_move_logits"]
+            )
+            _, conditional_logp = joint_move_log_probs(
+                aux["ponder_logits"], aux["conditional_move_logits"], legal
+            )
+            joint_nll, posterior_nll, time_weight = joint_time_nll_sums(
+                aux["ponder_logits"], conditional_logp, batch, w
+            )
+            joint_metrics = {
+                "joint_time_weight": time_weight,
+                "joint_nll": joint_nll,
+                "effort_given_move_nll": posterior_nll,
+            }
+        correct_unmasked = (jnp.argmax(unmasked, -1) == batch["move"]).astype(
+            jnp.float32
+        ) * w
 
         vnll = (
             -jnp.take_along_axis(
@@ -75,7 +105,7 @@ def make_eval_step(graphdef: nnx.GraphDef, data_sharding, repl, sf_max_cp_loss: 
             "correct": correct.sum(),
             "correct_top3": correct_top3.sum(),
             "correct_unmasked": correct_unmasked.sum(),
-            "nll": nll.sum(),
+            "nll": (nll * w).sum() if joint else nll.sum(),
             "entropy": entropy.sum(),
             "value_nll": vnll.sum(),
             "value_correct": vacc.sum(),
@@ -86,6 +116,7 @@ def make_eval_step(graphdef: nnx.GraphDef, data_sharding, repl, sf_max_cp_loss: 
             "bin_n": oh.sum(0),
             "bin_correct": (oh * correct[:, None]).sum(0),
             "bin_nll": (oh * nll[:, None]).sum(0),
+            **joint_metrics,
         }
 
     return jax.jit(step, in_shardings=(repl, data_sharding), out_shardings=repl)
@@ -112,6 +143,15 @@ def summarize(s: dict) -> dict:
         overall["anti_sf_engine_pick_rate"] = float(s["anti_sf_engine_pick"]) / anti_n
         overall["anti_sf_human_pref_prob"] = (
             float(s["anti_sf_human_pref_prob"]) / anti_n
+        )
+
+    time_weight = float(s.get("joint_time_weight", 0.0))
+    if "joint_time_weight" in s:
+        overall["joint_time_weight"] = time_weight
+    if time_weight > 0:
+        overall["joint_nll"] = float(s["joint_nll"]) / time_weight
+        overall["effort_given_move_nll"] = (
+            float(s["effort_given_move_nll"]) / time_weight
         )
 
     per_bin = {}

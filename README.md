@@ -50,3 +50,30 @@
    python -m chessforge.cli.uci \
      --config configs/chessforge_master_dpo.yaml --title GM --elo 2600 --format otb
    ```
+
+### Joint move and thinking-time prediction
+
+Enable the ChessformerV2 joint policy with `model_overrides.use_joint_move_time=true`.
+For the full joint objective, set `joint_time_coef=1.0`, `ponder_coef=0.0`,
+and `label_smoothing=0.0`. The objective uses move and effort likelihood on
+positions with valid clocks and marginal move likelihood on clockless positions.
+With `joint_time_coef=0.0`, the joint policy can be trained on moves alone or
+with the independent effort loss controlled by `ponder_coef`.
+
+The [joint 28M config](configs/chessforge_joint_time_28m.yaml) sets up the full
+objective. Point its data paths at your existing shards and use a fresh workdir
+for the joint checkpoint. For CPU runs, pass
+`--set model_overrides.compute_dtype=float32` on each command.
+
+```bash
+python -m chessforge.cli.train --config configs/chessforge_joint_time_28m.yaml
+python -m chessforge.cli.eval --config configs/chessforge_joint_time_28m.yaml --batch_size 64
+python -m chessforge.cli.uci --config configs/chessforge_joint_time_28m.yaml
+```
+
+The synthetic demo trains a tiny model and samples legal moves with their
+predicted thinking times. It requires no shards or checkpoint.
+
+```bash
+python -m chessforge.cli.demo_joint_time --steps 100
+```

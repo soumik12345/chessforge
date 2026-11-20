@@ -169,5 +169,5 @@ def test_chessformer_v2_forward_grad_dpo_and_eval(tmp_path: Path):
     assert res["overall"]["anti_sf_positions"] == 4
 
     sched = wsd_lr_schedule(4e-4, 1e-6, warmup=10, total_steps=100, decay_frac=0.2)
-    assert float(sched(50)) == 4e-4
+    np.testing.assert_allclose(sched(50), 4e-4)
     assert float(sched(100)) < 1e-5

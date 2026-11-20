@@ -153,6 +153,7 @@ def forward_model(
     deterministic: bool = True,
     rng: jax.Array | None = None,
     return_aux: bool = False,
+    mask_legal: bool = True,
 ):
     """Unified forward call for both Chessformer (v1) and ChessformerV2."""
     if isinstance(model, ChessformerV2):
@@ -168,6 +169,7 @@ def forward_model(
             oppo_title=batch.get("oppo_title"),
             game_format=batch.get("game_format"),
             clk_left=batch.get("clk_left"),
+            legal=batch.get("legal") if mask_legal else None,
             deterministic=deterministic,
             rng=rng,
             return_aux=return_aux,

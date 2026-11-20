@@ -45,6 +45,8 @@ class ModelConfig:
     ponder_buckets: int = 16
     elo_num_basis: int = 16
     remat_blocks: bool = False  # gradient checkpointing for v5e-1 / 16GB GPUs
+    use_joint_move_time: bool = False
+    joint_move_time_rank: int = 16  # rank of the effort-conditioned policy residual
 
     @property
     def dtype(self):
@@ -118,6 +120,7 @@ class TrainConfig:
     ckpt_every: int = 10_000
     keep_checkpoints: int = 3
     wandb_project: str = ""
+    joint_time_coef: float = 0.0  # posterior effort CE; 1 gives joint NLL
 
 
 def _from_dict(cls, d: dict[str, Any]):

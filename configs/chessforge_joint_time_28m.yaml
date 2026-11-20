@@ -1,0 +1,32 @@
+# Opt-in joint move/effort prototype. Train a fresh joint checkpoint.
+model: chessforge-v2-28m
+model_overrides:
+  compute_dtype: bfloat16
+  remat_blocks: true
+  use_joint_move_time: true
+  joint_move_time_rank: 16
+workdir: /tmp/chessforge_runs/joint_time_28m
+data:
+  train_glob: /mnt/maia3data/mix_1800plus_titled_otb/*/train/*.array_record
+  val_glob: /mnt/maia3data/pure_titled_and_otb/*/val/*.array_record
+  test_glob: /mnt/maia3data/eval_titled_antisf/*.array_record
+  local_cache_dir: /tmp/chessforge_shard_cache
+  global_batch_size: 256
+  eval_batch_size: 64
+  history_mask_prob: 0.05
+optim:
+  schedule: wsd
+  decay_frac: 0.20
+  lr: 4.0e-4
+  min_lr: 2.0e-6
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  warmup_steps: 2000
+  total_steps: 250000
+  grad_accum_steps: 4  # microbatch 64; profile memory before increasing
+value_coef: 0.10
+ponder_coef: 0.0  # effort supervision is already part of the joint objective
+joint_time_coef: 1.0
+reply_coef: 0.15
+label_smoothing: 0.0
+mask_illegal_in_loss: true

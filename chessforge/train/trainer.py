@@ -48,10 +48,30 @@ def log0(msg: str):
         print(msg, flush=True)
 
 
+def summarize_train_metrics(sums: dict, steps: int) -> dict[str, float]:
+    """Average update metrics, but weight joint NLL by valid clock examples."""
+    metrics = {k: float(v) / steps for k, v in sums.items()}
+    if "joint_nll_sum" in sums:
+        weight = float(sums["joint_time_weight"])
+        metrics["joint_time_weight"] = weight
+        metrics["joint_nll"] = float(sums["joint_nll_sum"]) / max(weight, 1e-8)
+        metrics.pop("joint_nll_sum")
+    return metrics
+
+
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.model_cfg = build_model_config(cfg.model, cfg.model_overrides)
+        if cfg.joint_time_coef < 0:
+            raise ValueError("joint_time_coef must be nonnegative")
+        if cfg.joint_time_coef > 0 and not (
+            self.model_cfg.arch == "chessformer_v2"
+            and self.model_cfg.use_joint_move_time
+        ):
+            raise ValueError(
+                "joint_time_coef requires ChessformerV2 use_joint_move_time=true"
+            )
         self.graphdef, _ = nnx.split(build_model(self.model_cfg, rngs=0))
         ndev = jax.device_count()
         accum = cfg.optim.grad_accum_steps
@@ -91,14 +111,25 @@ class Trainer:
         def loss_fn(params, ref_params, batch, rng):
             model = nnx.merge(graphdef, params)
             lm, lv, lp, aux = forward_model(
-                model, batch, deterministic=deterministic, rng=rng, return_aux=True
+                model,
+                batch,
+                deterministic=deterministic,
+                rng=rng,
+                return_aux=True,
+                mask_legal=cfg.mask_illegal_in_loss,
             )
             ref_lm = None
             if ref_params is not None:
                 ref_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), ref_params)
                 ref_model = nnx.merge(graphdef, ref_f32)
                 ref_lm, _, _ = jax.lax.stop_gradient(
-                    forward_model(ref_model, batch, deterministic=True, return_aux=False)
+                    forward_model(
+                        ref_model,
+                        batch,
+                        deterministic=True,
+                        return_aux=False,
+                        mask_legal=cfg.mask_illegal_in_loss,
+                    )
                 )
             return maia3_loss(
                 lm,
@@ -109,6 +140,7 @@ class Trainer:
                 ref_logits_move=ref_lm,
                 value_coef=cfg.value_coef,
                 ponder_coef=cfg.ponder_coef,
+                joint_time_coef=cfg.joint_time_coef,
                 reply_coef=cfg.reply_coef,
                 label_smoothing=cfg.label_smoothing,
                 dpo_coef=cfg.dpo_coef,
@@ -157,6 +189,14 @@ class Trainer:
                 )
                 grads = jax.tree.map(lambda g: g / accum, grads)
                 metrics = jax.tree.map(lambda m: m / accum, metrics)
+            if "joint_nll_sum" in metrics:
+                # Counts and numerators must sum across microbatches, including
+                # those with no clock labels; averaging their means is biased.
+                metrics["joint_time_weight"] *= accum
+                metrics["joint_nll_sum"] *= accum
+                metrics["joint_nll"] = metrics["joint_nll_sum"] / jnp.maximum(
+                    metrics["joint_time_weight"], 1e-8
+                )
             updates, opt_state = self.tx.update(grads, state.opt_state, state.params)
             params = optax.apply_updates(state.params, updates)
             metrics = dict(
@@ -358,7 +398,7 @@ class Trainer:
             n_acc += 1
 
             if step % cfg.log_every == 0:
-                m = {k: float(v) / n_acc for k, v in jax.device_get(acc).items()}
+                m = summarize_train_metrics(jax.device_get(acc), n_acc)
                 dt = time.time() - t0
                 m["positions_per_sec"] = n_acc * d.global_batch_size / max(dt, 1e-6)
                 log0(f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items()))

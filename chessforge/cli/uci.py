@@ -14,14 +14,13 @@ from collections import deque
 
 import chess
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
 from chessforge import chess_utils as cu
 from chessforge.config import load_train_config
 from chessforge.data.pipeline import _build_rich_time_and_meta
-from chessforge.models import build_model, build_model_config, forward_model
+from chessforge.models import build_model, forward_model
 from chessforge.train.trainer import Trainer
 
 
@@ -100,8 +99,9 @@ class ChessforgeUCIEngine:
         has_clk: float,
     ) -> dict[str, np.ndarray]:
         H = self.model_cfg.history
+        codes_seq = codes_seq[-H:]
         win = np.zeros((H, 64), np.int8)
-        win[H - len(codes_seq) :] = np.stack(codes_seq[-H:])
+        win[H - len(codes_seq) :] = np.stack(codes_seq)
         stm = int(board.turn == chess.BLACK)
         rel = cu.to_relative_codes(win, stm, len(codes_seq) - 1)
         cmask = cu.castling_mask(board)
@@ -118,7 +118,7 @@ class ChessforgeUCIEngine:
             np.asarray([epf], np.int32),
             np.asarray([rep_c], np.int32),
         )
-        return {
+        batch = {
             "board": rel[None],
             "time_info": np.asarray(
                 [[self.base_time / 100.0, self.inc_time / 100.0, clk_self / 100.0]],
@@ -135,6 +135,11 @@ class ChessforgeUCIEngine:
             "oppo_elo": np.asarray([oppo_elo], np.float32),
             "clk_left": np.asarray([clk_self], np.float32),
         }
+        if self.model_cfg.use_joint_move_time:
+            legal = np.zeros((1, cu.VOCAB_SIZE), dtype=bool)
+            legal[0, cu.legal_move_indices(board)] = True
+            batch["legal"] = legal
+        return batch
 
     def _idx_to_legal_move(self, idx: int) -> chess.Move | None:
         uci = cu.index_to_uci(int(idx))

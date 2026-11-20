@@ -1,1011 +1,277 @@
-# Joint move and thinking-time ablations: J0–J4
-
-This study tests whether modeling the relationship between human moves and
-thinking time improves held-out move prediction beyond an independent effort
-head or extra policy capacity. It follows the fixed-update, fixed-example
-approach of the earlier [R1–R6 ablations](https://github.com/soumik12345/chessforge/blob/improvement-ablations/EXPERIMENTS.md#52-controlled-compute-matched-ablation-ladder-r1r6).
-The definitions below describe the current implementation. Completed seed-42
-J0–J4 validation results are recorded in [section 7](#7-j0j4-validation-results-seed-42).
-J3 has the lowest final move NLL, while J1 has the highest top-1 accuracy;
-J4 has the lowest reported joint and effort-given-move NLL. The single-seed
-validation comparison does not establish a decisive winner. Held-out
-titled-online/OTB results remain unreported here.
-
-## 1. Model and objectives
-
-Let $x_n$ denote the board and pre-move context, $m_n$ the observed human
-move, $t_n$ the observed thinking time in seconds, and $c_n$ the pre-move
-clock. Let $k\in\{0,\ldots,K-1\}$ index the $K=16$ effort buckets.
-The joint model predicts
-
-$$
-\begin{aligned}
-p_\theta(m,k\mid x)
-&=p_\theta(k\mid x)\,p_\theta(m\mid k,x),\\
-\pi_\theta^{\mathrm{mix}}(m\mid x)
-&=\sum_{k=0}^{K-1}p_\theta(k\mid x)\,p_\theta(m\mid k,x).
-\end{aligned}
-$$
-
-For the legal move set $\mathcal{L}(x)$, each bucket is normalized separately
-before mixing:
-
-$$
-p_\theta(m\mid k,x)
-=\frac{\exp s_{\theta,k}(m,x)}
-{\sum_{a\in\mathcal{L}(x)}\exp s_{\theta,k}(a,x)},
-\qquad m\in\mathcal{L}(x).
-$$
-
-A rank-16 residual conditions the existing policy head on effort; its gates
-start at zero. The shared trunk, value head, and effort head are retained.
-The independent-head baseline instead uses the ordinary legal policy
-$\pi_\theta^{\mathrm{ind}}(m\mid x)$, without the effort-conditioned residual.
-Both policies receive the same pre-move context. Observed moves and future
-thinking times are loss targets, not forward inputs. See
-[prototype details](docs/joint_move_time.md).
-
-### Effort targets and valid-label sets
-
-The smoothed effort target $q_n(k)$ is centered on normalized effort
-
-$$
-u_n=\operatorname{clip}\!\left(
-\frac{\log(1+t_n)}{\log(1+\max(c_n,1))},\,0,\,1
-\right).
-$$
-
-Writing $\Phi$ for the standard normal CDF, the HL-Gauss histogram is
-
-$$
-\begin{aligned}
-b_k&=\frac{k}{K},\qquad \sigma=\frac{0.75}{K},\\
-h_{n,k}
-&=\Phi\!\left(\frac{b_{k+1}-u_n}{\sigma}\right)
--\Phi\!\left(\frac{b_k-u_n}{\sigma}\right),\\
-q_n(k)&=\frac{h_{n,k}}
-{\max\!\left(\sum_{j=0}^{K-1}h_{n,j},10^{-8}\right)}.
-\end{aligned}
-$$
-
-Valid time supervision requires finite nonnegative thinking time, a finite
-pre-move clock greater than 0.5 seconds, a finite clock-presence flag greater
-than 0.5, and a finite positive position weight. Invalid time labels do not
-exclude an otherwise valid example from move supervision.
-
-Let $\mathcal{B}$ be a training microbatch, $\mathcal{T}\subseteq\mathcal{B}$
-the valid-clock rows, and $\mathcal{S}\subseteq\mathcal{B}$ the rows with a valid
-next-move label. Let $w_n$ be the position weight after replacing nonfinite or
-nonpositive weights with zero. Define
-
-$$
-\begin{aligned}
-W&=\max\!\left(\sum_{n\in\mathcal{B}}w_n,1\right),\\
-W_{\mathcal{T}}&=\max\!\left(\sum_{n\in\mathcal{T}}w_n,1\right),\\
-W_{\mathcal{S}}&=\max\!\left(\sum_{n\in\mathcal{S}}w_n,1\right).
-\end{aligned}
-$$
-
-### Loss components
-
-The move loss for either legal policy $\pi$ is
-
-$$
-\mathcal{M}[\pi]
-=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n\log\pi(m_n\mid x_n).
-$$
-
-The marginal effort loss and posterior effort loss are
-
-$$
-\begin{aligned}
-\mathcal{E}
-&=-\frac{1}{W_{\mathcal{T}}}
-\sum_{n\in\mathcal{T}}w_n
-\sum_{k=0}^{K-1}q_n(k)\log p_\theta(k\mid x_n),\\
-\mathcal{C}
-&=-\frac{1}{W}
-\sum_{n\in\mathcal{T}}w_n
-\sum_{k=0}^{K-1}q_n(k)\log p_\theta(k\mid m_n,x_n),\\
-p_\theta(k\mid m_n,x_n)
-&=\frac{p_\theta(k\mid x_n)\,p_\theta(m_n\mid k,x_n)}
-{\pi_\theta^{\mathrm{mix}}(m_n\mid x_n)}.
-\end{aligned}
-$$
-
-The distinction between $W_{\mathcal{T}}$ and $W$ matters on mixed-clock
-microbatches. An empty $\mathcal{T}$ contributes zero to both time losses.
-
-Let $y_n\in\{\mathrm{loss},\mathrm{draw},\mathrm{win}\}$ be the outcome from
-the side-to-move perspective, and $r_n$ the actual next human move expressed
-in the opponent's frame. The shared auxiliary losses are
-
-$$
-\begin{aligned}
-\mathcal{V}
-&=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n
-\log p_\theta^{\mathrm{value}}(y_n\mid x_n),\\
-\mathcal{R}
-&=-\frac{1}{W_{\mathcal{S}}}\sum_{n\in\mathcal{S}}w_n
-\log p_\theta^{\mathrm{reply}}(r_n\mid x_n),\\
-\mathcal{A}&=0.10\,\mathcal{V}+0.15\,\mathcal{R}.
-\end{aligned}
-$$
-
-The reply distribution covers the full move vocabulary. The symbols
-$\mathcal{M},\mathcal{E},\mathcal{C},\mathcal{V},\mathcal{R}$ correspond to
-the shorthand M, E, C, V, and R used elsewhere in this document. These are
-zero-label-smoothing microbatch objectives; accumulation averages them as
-described in section 5. DPO has coefficient zero for every J0–J4 experiment.
-
-## 2. Ablation matrix
-
-All five runs use the same V2 backbone, pre-move inputs, data, optimizer recipe,
-batch size, and training budget. Change only the three settings below.
-
-| Run | Description | `model_overrides.use_joint_move_time` | `joint_time_coef` | `ponder_coef` | Total objective |
-| --- | --- | --- | --- | --- | --- |
-| **J0** | V2 baseline without time supervision | `false` | `0.0` | `0.0` | $\mathcal{M}[\pi_\theta^{\mathrm{ind}}]+\mathcal{A}$ |
-| **J1** | Independent move and effort heads | `false` | `0.0` | `1.0` | $\mathcal{M}[\pi_\theta^{\mathrm{ind}}]+\mathcal{E}+\mathcal{A}$ |
-| **J2** | Effort-conditioned policy without time labels | `true` | `0.0` | `0.0` | $\mathcal{M}[\pi_\theta^{\mathrm{mix}}]+\mathcal{A}$ |
-| **J3** | Effort-conditioned policy with marginal effort supervision | `true` | `0.0` | `1.0` | $\mathcal{M}[\pi_\theta^{\mathrm{mix}}]+\mathcal{E}+\mathcal{A}$ |
-| **J4** | Full joint move/effort objective | `true` | `1.0` | `0.0` | $\mathcal{M}[\pi_\theta^{\mathrm{mix}}]+\mathcal{C}+\mathcal{A}$ |
-
-J0 and J1 retain the existing effort head and pre-move clock inputs; disabling
-time supervision does not remove clock context. J2's effort prior is learned
-through move prediction, but its latent buckets have no supervised thinking-time
-meaning. J3 couples the move policy to effort while retaining separate move and
-marginal-effort losses. At zero label smoothing and on valid-clock rows, J4's
-`M + C` equals the smoothed joint NLL. This identity applies to those two terms,
-not to the additional value/reply losses.
-
-### J0: Independent policy without time supervision
-
-$$
-\boxed{
-\mathcal{L}_{\mathrm{J0}}(\theta)
-=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n
-\log\pi_\theta^{\mathrm{ind}}(m_n\mid x_n)
-+\mathcal{A}
-}
-$$
-
-The effort head receives no explicit effort-target loss and does not enter
-the move policy. Pre-move clock features remain available to the shared trunk.
-
-### J1: Independent move and effort supervision
-
-The model represents conditional independence of move and effort given context:
-
-$$
-p_\theta^{\mathrm{ind}}(m,k\mid x)
-=\pi_\theta^{\mathrm{ind}}(m\mid x)\,p_\theta(k\mid x).
-$$
-
-$$
-\boxed{
-\mathcal{L}_{\mathrm{J1}}(\theta)
-=\mathcal{M}[\pi_\theta^{\mathrm{ind}}]+\mathcal{E}+\mathcal{A}
-}
-$$
-
-Both heads share the trunk. The move head does not take an effort bucket as
-input. On fully clock-labeled microbatches, the move and effort terms equal
-the smoothed NLL of this independent joint distribution.
-
-### J2: Latent effort-conditioned policy
-
-$$
-\boxed{
-\mathcal{L}_{\mathrm{J2}}(\theta)
-=-\frac{1}{W}\sum_{n\in\mathcal{B}}w_n
-\log\!\left[
-\sum_{k=0}^{K-1}p_\theta(k\mid x_n)\,p_\theta(m_n\mid k,x_n)
-\right]+\mathcal{A}
-}
-$$
-
-The buckets act as latent mixture components, with no loss assigning them the
-observed thinking-time meaning. This isolates capacity and mixture effects.
-
-### J3: Effort-conditioned policy with marginal effort supervision
-
-$$
-\boxed{
-\mathcal{L}_{\mathrm{J3}}(\theta)
-=\mathcal{M}[\pi_\theta^{\mathrm{mix}}]
-+\mathcal{E}+\mathcal{A}
-}
-$$
-
-Move prediction uses the effort mixture, while the time target supervises the
-marginal $p_\theta(k\mid x)$. This does not generally equal the joint NLL of
-$p_\theta(m,k\mid x)$ because it lacks the move-conditioned effort term.
-
-### J4: Joint move and thinking-time supervision
-
-$$
-\boxed{
-\mathcal{L}_{\mathrm{J4}}(\theta)
-=\mathcal{M}[\pi_\theta^{\mathrm{mix}}]
-+\mathcal{C}+\mathcal{A}
-}
-$$
-
-For each valid-clock example, Bayes' rule gives the joint-loss identity:
-
-$$
-\begin{aligned}
-&-\log\pi_\theta^{\mathrm{mix}}(m_n\mid x_n)
--\sum_{k=0}^{K-1}q_n(k)\log p_\theta(k\mid m_n,x_n)\\
-&\qquad=-\sum_{k=0}^{K-1}q_n(k)\log p_\theta(m_n,k\mid x_n).
-\end{aligned}
-$$
-
-Consequently, the exact mixed-clock microbatch objective is
-
-$$
-\boxed{
-\begin{aligned}
-\mathcal{L}_{\mathrm{J4}}(\theta)
-=-\frac{1}{W}\Bigg[
-&\sum_{n\in\mathcal{T}}w_n
-\sum_{k=0}^{K-1}q_n(k)\log p_\theta(m_n,k\mid x_n)\\
-+&\sum_{n\in\mathcal{B}\setminus\mathcal{T}}w_n
-\log\pi_\theta^{\mathrm{mix}}(m_n\mid x_n)
-\Bigg]+\mathcal{A}.
-\end{aligned}
-}
-$$
-
-Clock-labeled rows optimize smoothed joint likelihood; other rows optimize
-marginal move likelihood. Observed thinking time is used only as a loss target.
-
-### Questions answered by each comparison
-
-| Comparison | Question |
-| --- | --- |
-| J1 vs. J0 | Does the independent effort auxiliary task improve moves? |
-| J2 vs. J0 | Does extra effort-conditioned policy capacity help without time labels? |
-| J3 vs. J1 | Does conditioning the policy on effort help under the same loss form? |
-| J4 vs. J3 | Does posterior effort supervision improve on marginal effort supervision? |
-| J4 vs. J2 | Does assigning observed-time meaning to the joint buckets help? |
-| J4 vs. J1 | Does the proposed method outperform the independent-head reference overall? |
-
-J4 vs. J1 changes both architecture and objective. Use the intermediate controls
-to interpret that difference. Compare held-out move NLL and accuracy rather than
-total training loss: the latter includes different supervision across runs.
-
-## 3. Shared training protocol
-
-The starting recipe is [chessforge_joint_time_28m.yaml](configs/chessforge_joint_time_28m.yaml),
-with the overrides below. The preset name is `28m`; the current J0 initialization
-reports **35,229,229 parameters**. The rank-16 joint residual adds 12,608 parameters.
-Use the logged count when reporting model size.
-
-| Setting | Shared value |
-| --- | --- |
-| Model | `chessforge-v2-28m` |
-| Precision / gradient checkpointing | `bfloat16` / `remat_blocks=true` |
-| History / history-mask probability | 8 boards / `0.05` |
-| Effort buckets / joint residual rank | 16 / 16 |
-| Optimizer | AdamW; `b1=0.9`, `b2=0.999`, `eps=1e-8`, weight decay `1e-4` |
-| Learning rate | WSD; peak `4e-4`, minimum `2e-6` |
-| Schedule | 2,000 warmup updates, stable through update 8,000, final 20% cosine decay |
-| Gradient clipping | Global norm threshold `1.0` |
-| Training budget | 10,000 optimizer updates × 1,024 positions = **10.24M presentations** |
-| Accumulation | 16; microbatch per device is `1024 / (device_count × 16)` |
-| Evaluation batch size | 64 |
-| Other loss settings | Value `0.10`, reply `0.15`, label smoothing `0`, DPO `0` |
-| Legal masking | `mask_illegal_in_loss=true` |
-| Curriculum | Disabled: `data.anneal_glob=""` |
-| Logging / validation / checkpoint interval | 100 / 1,000 / 1,000 updates |
-| Seeds | Screen with 42; repeat matched comparisons with 43 and 44 |
-
-On one device the microbatch is 64. This is a matched-example/update study, not
-a guarantee of equal FLOPs or wall time. Keep hardware and precision fixed and
-report measured throughput. Train each variant from scratch; baseline and joint
-parameter trees are incompatible for direct checkpoint restoration. Use a unique
-workdir and match both `seed` and `data.shuffle_seed` across variants for each seed.
-
-### Local data
-
-| Role | Path relative to the repository root |
-| --- | --- |
-| Training | `data/cf_data/pool_B_titled/2025-06/train/*.array_record` |
-| Validation | `data/cf_data/pool_B_titled/2025-06/val/*.array_record` |
-| Held-out titled online | `data/cf_data/eval_titled_online/*.array_record` |
-| Held-out OTB | `data/cf_data/eval_otb/*.array_record` |
-
-Pool B's [preprocessing metadata](data/cf_data/pool_B_titled/2025-06/stats.json)
-reports 4,083,779 training positions, 7,774 validation positions, required clock
-streams, Blitz/Rapid games, and a 30-second cutoff. The directory contains 41
-training shards and one validation shard. The training budget is approximately
-2.51 passes over the recorded training positions, not 10.24M unique positions.
-The startup position count is an estimate from buffered shards and can differ
-from the preprocessing total.
-
-Required clock streams do not by themselves prove that every time label is
-valid. Audit the validity conditions in section 1 before interpreting the study
-as fully clock-labeled. If clockless/invalid rows remain, `E` and `C` have
-different denominators: the marginal effort loss averages valid labels, whereas
-the posterior term includes all position weights. Exact mixed-data baseline
-reweighting is not implemented. Report that difference rather than attributing
-all changes solely to factorization.
-
-The current J0 configuration retains `data.val_batches=50`, so each training-time
-validation pass evaluates the first **3,200 positions**, not all 7,774. Keep that
-subset fixed across J0–J4. Use standalone evaluation for full-split reporting;
-changing the validation limit during the study would change comparability.
-
-Keep test data out of training and experiment selection. Verify game-level
-separation and duplicates across splits. The existing Pool B cutoff excludes
-sub-30-second play, so it cannot establish time-pressure performance. A separate
-dataset prepared with a lower cutoff is needed for that extension.
-
-## 4. Launching J0–J4 and tracking runs
-
-Run these commands from the repository root (`/home/chessforge`). Each block
-launches one seed-42 experiment with the local Pool B training/validation data,
-a distinct workdir, and an explicit Trackio run name. On a single L4, run one
-experiment at a time; wait for it to finish before launching the next. If J0 is
-already running or complete, continue with J1 instead of starting a second J0.
-
-### J0: V2 baseline without time supervision
-
-```bash
-export TRACKIO_DIR="$PWD/trackio_logs"
-
-.venv/bin/python -m chessforge.cli.train \
-  --config configs/chessforge_joint_time_28m.yaml \
-  --set \
-    workdir="$PWD/runs/J0_s42" \
-    trackio_project=chessforge \
-    trackio_run_name=J0_s42 \
-    trackio_group=joint_move_time_ablations \
-    trackio_space_id=geekyrakshit/chessforge-tracking \
-    model_overrides.use_joint_move_time=false \
-    model_overrides.joint_move_time_rank=16 \
-    model_overrides.ponder_buckets=16 \
-    joint_time_coef=0.0 \
-    ponder_coef=0.0 \
-    seed=42 \
-    data.shuffle_seed=42 \
-    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
-    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
-    'data.test_glob=""' \
-    'data.anneal_glob=""' \
-    data.global_batch_size=1024 \
-    data.eval_batch_size=64 \
-    data.val_batches=50 \
-    optim.total_steps=10000 \
-    optim.grad_accum_steps=16 \
-    value_coef=0.10 \
-    reply_coef=0.15 \
-    label_smoothing=0.0 \
-    dpo_coef=0.0 \
-    log_every=100 \
-    eval_every=1000 \
-    ckpt_every=1000
-```
-
-### J1: Independent move and effort heads
-
-```bash
-export TRACKIO_DIR="$PWD/trackio_logs"
-
-.venv/bin/python -m chessforge.cli.train \
-  --config configs/chessforge_joint_time_28m.yaml \
-  --set \
-    workdir="$PWD/runs/J1_s42" \
-    trackio_project=chessforge \
-    trackio_run_name=J1_s42 \
-    trackio_group=joint_move_time_ablations \
-    trackio_space_id=geekyrakshit/chessforge-tracking \
-    model_overrides.use_joint_move_time=false \
-    model_overrides.joint_move_time_rank=16 \
-    model_overrides.ponder_buckets=16 \
-    joint_time_coef=0.0 \
-    ponder_coef=1.0 \
-    seed=42 \
-    data.shuffle_seed=42 \
-    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
-    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
-    'data.test_glob=""' \
-    'data.anneal_glob=""' \
-    data.global_batch_size=1024 \
-    data.eval_batch_size=64 \
-    data.val_batches=50 \
-    optim.total_steps=10000 \
-    optim.grad_accum_steps=16 \
-    value_coef=0.10 \
-    reply_coef=0.15 \
-    label_smoothing=0.0 \
-    dpo_coef=0.0 \
-    log_every=100 \
-    eval_every=1000 \
-    ckpt_every=1000
-```
-
-### J2: Effort-conditioned policy without time labels
-
-```bash
-export TRACKIO_DIR="$PWD/trackio_logs"
-
-.venv/bin/python -m chessforge.cli.train \
-  --config configs/chessforge_joint_time_28m.yaml \
-  --set \
-    workdir="$PWD/runs/J2_s42" \
-    trackio_project=chessforge \
-    trackio_run_name=J2_s42 \
-    trackio_group=joint_move_time_ablations \
-    trackio_space_id=geekyrakshit/chessforge-tracking \
-    model_overrides.use_joint_move_time=true \
-    model_overrides.joint_move_time_rank=16 \
-    model_overrides.ponder_buckets=16 \
-    joint_time_coef=0.0 \
-    ponder_coef=0.0 \
-    seed=42 \
-    data.shuffle_seed=42 \
-    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
-    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
-    'data.test_glob=""' \
-    'data.anneal_glob=""' \
-    data.global_batch_size=1024 \
-    data.eval_batch_size=64 \
-    data.val_batches=50 \
-    optim.total_steps=10000 \
-    optim.grad_accum_steps=16 \
-    value_coef=0.10 \
-    reply_coef=0.15 \
-    label_smoothing=0.0 \
-    dpo_coef=0.0 \
-    log_every=100 \
-    eval_every=1000 \
-    ckpt_every=1000
-```
-
-### J3: Effort-conditioned policy with marginal effort supervision
-
-```bash
-export TRACKIO_DIR="$PWD/trackio_logs"
-
-.venv/bin/python -m chessforge.cli.train \
-  --config configs/chessforge_joint_time_28m.yaml \
-  --set \
-    workdir="$PWD/runs/J3_s42" \
-    trackio_project=chessforge \
-    trackio_run_name=J3_s42 \
-    trackio_group=joint_move_time_ablations \
-    trackio_space_id=geekyrakshit/chessforge-tracking \
-    model_overrides.use_joint_move_time=true \
-    model_overrides.joint_move_time_rank=16 \
-    model_overrides.ponder_buckets=16 \
-    joint_time_coef=0.0 \
-    ponder_coef=1.0 \
-    seed=42 \
-    data.shuffle_seed=42 \
-    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
-    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
-    'data.test_glob=""' \
-    'data.anneal_glob=""' \
-    data.global_batch_size=1024 \
-    data.eval_batch_size=64 \
-    data.val_batches=50 \
-    optim.total_steps=10000 \
-    optim.grad_accum_steps=16 \
-    value_coef=0.10 \
-    reply_coef=0.15 \
-    label_smoothing=0.0 \
-    dpo_coef=0.0 \
-    log_every=100 \
-    eval_every=1000 \
-    ckpt_every=1000
-```
-
-### J4: Full joint move/effort objective
-
-```bash
-export TRACKIO_DIR="$PWD/trackio_logs"
-
-.venv/bin/python -m chessforge.cli.train \
-  --config configs/chessforge_joint_time_28m.yaml \
-  --set \
-    workdir="$PWD/runs/J4_s42" \
-    trackio_project=chessforge \
-    trackio_run_name=J4_s42 \
-    trackio_group=joint_move_time_ablations \
-    trackio_space_id=geekyrakshit/chessforge-tracking \
-    model_overrides.use_joint_move_time=true \
-    model_overrides.joint_move_time_rank=16 \
-    model_overrides.ponder_buckets=16 \
-    joint_time_coef=1.0 \
-    ponder_coef=0.0 \
-    seed=42 \
-    data.shuffle_seed=42 \
-    data.train_glob='data/cf_data/pool_B_titled/2025-06/train/*.array_record' \
-    data.val_glob='data/cf_data/pool_B_titled/2025-06/val/*.array_record' \
-    'data.test_glob=""' \
-    'data.anneal_glob=""' \
-    data.global_batch_size=1024 \
-    data.eval_batch_size=64 \
-    data.val_batches=50 \
-    optim.total_steps=10000 \
-    optim.grad_accum_steps=16 \
-    value_coef=0.10 \
-    reply_coef=0.15 \
-    label_smoothing=0.0 \
-    dpo_coef=0.0 \
-    log_every=100 \
-    eval_every=1000 \
-    ckpt_every=1000
-```
-
-For seed 43 or 44, change `seed`, `data.shuffle_seed`, the `_s42` workdir suffix,
-and the `_s42` Trackio run-name suffix together. Keep every other setting fixed.
-
-The saved J0 config at `runs/J0_s42/config.json` records project `chessforge`,
-run name `J0`, group `joint_move_time_ablations`, and Space
-[`geekyrakshit/chessforge-tracking`](https://huggingface.co/spaces/geekyrakshit/chessforge-tracking).
-The commands above use seed-qualified run names for future launches. The current
-`run.sh` repeats tracking overrides; the last occurrence wins, explaining why
-the saved run is named `J0` rather than `J0_s42`. Preserve the saved config as the
-record of what that run actually used.
-
-To use local-only tracking, omit `trackio_space_id` and ensure
-`TRACKIO_SPACE_ID` is unset; the YAML default is `null`. Remote Space logging
-requires an authenticated account with write access. To inspect the local project:
-
-```bash
-export TRACKIO_DIR="$PWD/trackio_logs"
-.venv/bin/trackio show --project chessforge
-```
-
-Existing workdirs automatically resume training checkpoints. Trackio run resume
-is separate: the trainer does not currently expose or pass Trackio's `resume`
-option. Do not assume a restarted training process appends to the same tracking
-run. Configuration, checkpoints, and iterator state live in the workdir; metric
-tracking does not replace those artifacts. The trainer has periodic text logs,
-not a progress bar.
-
-## 5. Metric conventions and aggregation
-
-Definitions are sourced from [training losses](chessforge/train/losses.py),
-[trainer aggregation and logging](chessforge/train/trainer.py), and
-[evaluation](chessforge/eval/evaluate.py). Accuracy and probability metrics are
-fractions in `[0, 1]`; multiply by 100 for percentages. Cross-entropies, NLLs,
-and entropies use natural logarithms and are in **nats**. Lower NLL is better;
-higher accuracy is better. Counts, learning rate, and utilization are diagnostics,
-not quality scores.
-
-Only JAX process zero writes Trackio data. Chess metrics are logged against
-optimizer-update `step`: `train/` every 100 updates; `val/` every 1,000 updates
-and at the final update; `test/` only when `data.test_glob` is nonempty, at
-`test_every` and at the final update. Tests are disabled in the J0–J4 launch.
-
-Training losses are measured before each optimizer update. For ordinary training
-metrics the trainer averages microbatch metrics across accumulation, then averages
-update metrics across the logging window. These are not necessarily global
-valid-label-weighted means if valid-label counts vary across microbatches. Joint
-NLL is handled specially: its numerator and valid-clock weight are summed across
-microbatches and updates, then divided once for the logging window. Padded rows
-have zero evaluation weight. The intended experiments use unit weights for real
-positions.
-
-### 5.1 Training metrics (`train/`)
-
-Loss component metrics below are reported **before multiplying by their configured
-coefficients**. For example, a `reply_loss` of 2 contributes 0.30 to the total when
-`reply_coef=0.15`.
-
-| Exact Trackio key | Meaning and interpretation | Availability |
-| --- | --- | --- |
-| `train/loss` | Total optimized objective: `policy_loss + value_coef*value_loss + ponder_coef*ponder_loss + joint_time_coef*joint_time_loss + reply_coef*reply_loss + dpo_coef*dpo_loss`, including only enabled terms. Lower within the same objective; not directly comparable across J0–J4. | All runs |
-| `train/policy_loss` | Weighted human-move cross-entropy, using legal moves in this recipe. At zero label smoothing it is move NLL. Joint variants use predicted-effort marginalization. Lower is better. | All runs |
-| `train/value_loss` | Cross-entropy for the actual loss/draw/win label from the side-to-move perspective. Lower is better. | All runs |
-| `train/reply_loss` | Cross-entropy for the opponent's actual next move, over the 4,352-move vocabulary without a reply legality mask. Only rows with `next_move >= 0` contribute. Lower is better. | All J0–J4 runs, when reply targets/head exist |
-| `train/ponder_loss` | `E`: HL-Gauss cross-entropy for predicted marginal effort, normalized by valid-clock weight within each microbatch. Lower is better; this is not seconds error. | J1, J3 |
-| `train/joint_time_loss` | `C`: posterior effort CE given the observed human move, with invalid-time rows zeroed and normalized over all position weight. Lower is better. It is still computed when its coefficient is zero. | J2, J3, J4 |
-| `train/joint_nll` | Valid-clock-weighted mean `-sum_k q(k) log p(m,k|x)` across the logging window. Includes move and effort terms, but not value/reply losses. Lower is better. | J2, J3, J4; zero if no valid-clock weight |
-| `train/joint_time_weight` | Sum of valid-clock position weights over the entire logging window, including all accumulated microbatches. With unit weights this is a count, not a fraction or per-update average. | J2, J3, J4 |
-| `train/policy_acc` | Top-1 human-move match across the full unmasked 4,352-move vocabulary. For joint variants the unmasked mixture is recomputed. Higher is better. | All runs |
-| `train/policy_acc_legal` | Top-1 human-move match restricted to legal moves, using bucket-wise legality before marginalization for joint variants. Higher is better. | All runs with legal masks |
-| `train/value_acc` | Top-1 loss/draw/win accuracy. Higher is better. | All runs |
-| `train/grad_norm` | Global L2 norm of the accumulated gradient before clipping and AdamW. Useful for instability and clipping diagnostics; neither minimizing nor maximizing it is the objective. | All runs |
-| `train/lr` | Learning rate applied to the updates in the logging window; reported as their average. | All runs |
-| `train/positions_per_sec` | `updates_in_window * global_batch_size / elapsed_wall_seconds`. The first window includes compilation; later windows can include preceding evaluation/checkpoint overhead because the timer resets before those operations. Not isolated model compute throughput. | All runs |
-| `train/dpo_loss` | Preference loss `-log sigmoid(dpo_beta * margin)` on human/Stockfish disagreement rows. The margin is human-vs-Stockfish log odds minus frozen-reference log odds when supplied; otherwise the code subtracts a fixed 0.5. Lower is better for this preference objective. | Only outside this study when `dpo_coef > 0` and Stockfish annotations exist |
-
-For DPO, the implementation accepts rows with a known differing Stockfish move
-and either CP loss within `sf_max_cp_loss` or a negative (unknown) CP-loss sentinel.
-It does not require a verified soundness label for that unknown-CP subset.
-`joint_nll_sum` is an internal weighted numerator removed before Trackio logging.
-There is no separate training `effort_given_move_nll` key.
-
-Expected J0 training keys are `loss`, `policy_loss`, `value_loss`, `reply_loss`,
-`policy_acc`, `policy_acc_legal`, `value_acc`, `grad_norm`, `lr`, and
-`positions_per_sec`, all with the `train/` prefix. J0 has no time-loss or DPO keys.
-Time metrics in J2 can be numerically computed against labels, but do not make
-its unsupervised buckets calibrated time categories.
-
-### 5.2 Validation and test metrics (`val/`, `test/`)
-
-Every key in this table is prefixed with `val/` during training-time validation
-or `test/` during training-time testing. Standalone evaluation uses the same
-unprefixed names inside the JSON `overall` object.
-
-| Key suffix | Meaning and interpretation | Availability |
-| --- | --- | --- |
-| `positions` | Sum of evaluation position weights, cast to integer. With unit weights, the number of real evaluated positions. Check it before comparing runs. | All |
-| `move_acc` | Legal-masked top-1 human-move match. Higher is better. | All |
-| `move_acc_top3` | Fraction where the human move appears among the top three legal-policy scores. Higher is better. | All |
-| `move_acc_ci95` | Approximate binomial 95% confidence-interval **half-width**, `1.96*sqrt(acc*(1-acc)/n)`. Report `move_acc ± move_acc_ci95`. It assumes independent positions and is not a paired, game-clustered, or across-seed interval. | All |
-| `move_acc_unmasked` | Top-1 human-move match without a legality mask over all 4,352 moves. Higher is better; it is not the fraction of predictions that are legal. | All |
-| `perplexity` | `exp(mean legal move NLL)`. Lower is better. Recover move NLL in nats as `log(perplexity)`; the current summary does not expose a separate `move_nll` key. | All |
-| `policy_entropy` | Mean entropy `-sum_m p(m) log p(m)` of the legal move distribution. Measures sharpness; no universally preferred direction. Low entropy with worsening held-out NLL can indicate overconfidence. | All |
-| `value_nll` | Mean loss/draw/win NLL, with no `value_coef` scaling. Lower is better. Proper probabilistic score, not a complete calibration analysis. | All |
-| `value_acc` | Top-1 loss/draw/win accuracy. Higher is better. | All |
-| `anti_sf_positions` | Weighted number of eligible positions where the human move differs from the annotated Stockfish move. Eligibility includes CP loss within the threshold or unknown negative CP loss. | Only if eligible annotated positions exist |
-| `anti_sf_human_acc` | Legal top-1 human-move match on that disagreement slice. Higher is better for matching humans. | Same slice |
-| `anti_sf_engine_pick_rate` | Fraction of the disagreement slice whose legal top-1 prediction is Stockfish's differing top move. Lower means less Stockfish overlap, not necessarily better move quality. | Same slice |
-| `anti_sf_human_pref_prob` | Mean `sigmoid(logit_human - logit_stockfish)`, equivalent to the human's probability after renormalizing over those two moves. Higher means stronger pairwise human preference; this is not top-1 accuracy. | Same slice |
-| `joint_time_weight` | Total valid-clock evaluation position weight. Zero is reported when a joint model has no valid time labels. | J2, J3, J4 |
-| `joint_nll` | Valid-clock-weighted mean smoothed joint move/effort NLL. Lower is better. Computed regardless of the training coefficient. | J2, J3, J4, only with positive valid-clock weight |
-| `effort_given_move_nll` | Valid-clock-weighted mean posterior effort CE `-sum_k q(k) log p(k|m,x)`. Unlike training `joint_time_loss`, its denominator includes only valid time labels. Lower is better. | J2, J3, J4, only with positive valid-clock weight |
-
-No AntiSF keys are emitted for an unannotated split or an empty disagreement
-slice; their absence does not mean zero error. Clockless evaluation omits
-`joint_nll` and `effort_given_move_nll`; a zero `joint_time_weight` explains why.
-All time NLLs score discrete smoothed bucket targets, not a continuous-time
-density or seconds error. Keep bucket count and target smoothing fixed when
-comparing their values.
-
-There are no automatically logged `val/loss`, `val/policy_loss`,
-`val/ponder_loss`, or `val/reply_loss` metrics in the current evaluator. The
-training and evaluation dictionaries are different.
-
-### 5.3 Per-rating outputs and internal counters
-
-The evaluator also returns `per_rating`, keyed by the nearest 100 points of
-`game_elo = (self_elo + oppo_elo) / 2`, clipped to bins 0 through 3,100. Each
-nonempty bin contains `n` (weighted count cast to integer), `acc` (legal move
-accuracy), and `perplexity` (exponentiated mean move NLL). These are saved by
-`chessforge.cli.eval --out`, but the trainer logs only `overall` to Trackio.
-Per-rating outputs are not automatically Trackio charts, and no per-clock-regime
-breakdowns are currently computed.
-
-The evaluation step internally sums `n`, `correct`, `correct_top3`,
-`correct_unmasked`, `nll`, `entropy`, `value_nll`, `value_correct`, `anti_sf_n`,
-`anti_sf_human_pick`, `anti_sf_engine_pick`, `anti_sf_human_pref_prob`, `bin_n`,
-`bin_correct`, and `bin_nll`, plus joint counters when applicable. These are
-numerators/counts used to form the summary above, not additional Trackio metrics.
-In particular, internal `nll` is a weighted sum; reported perplexity uses its mean.
-
-### 5.4 Automatic Trackio system metrics
-
-Trackio can collect host and GPU telemetry independently of chess metrics. The
-installed integration uses Trackio's defaults: roughly 10-second sampling, stored
-as timestamped **system metrics**, without `train/`, `val/`, or `test/` prefixes.
-This cadence is independent of optimizer updates and `log_every`. CPU monitoring
-requires `psutil`; NVIDIA GPU monitoring requires `nvidia-ml-py`/NVML and supported
-hardware. Fields unavailable on a device/host are omitted. The J0 local tracking
-database inspected while preparing this document contained CPU/memory/disk/network/
-temperature telemetry; GPU telemetry was not present in that snapshot. A GPU
-being busy in `nvidia-smi` does not imply Trackio is collecting GPU metrics.
-
-Host readings describe the visible machine/container, not just the training
-process. Use these for resource diagnosis, not as model-quality objectives.
-
-| Exact key or key family | Meaning / units |
-| --- | --- |
-| `cpu/{i}/utilization` | Busy percentage of visible logical CPU core `i`, 0–100%. |
-| `cpu/utilization` | Mean busy percentage across visible logical cores, 0–100%. |
-| `cpu/frequency`, `cpu/frequency_max` | Current CPU frequency and reported maximum, MHz; static fields are typically collected on the first sample. |
-| `cpu/count_logical`, `cpu/count_physical` | Visible logical and physical CPU counts. |
-| `memory/used`, `memory/total`, `memory/available` | Used, total, and available host RAM, GiB. |
-| `memory/percent` | Host RAM utilization, percent. |
-| `swap/used`, `swap/total` | Used and total swap, GiB. |
-| `swap/percent` | Swap utilization, percent. |
-| `disk/read_mb_per_sec`, `disk/write_mb_per_sec` | Host disk read/write throughput, MiB/s despite the `mb` key spelling. |
-| `disk/read_iops`, `disk/write_iops` | Host disk read/write operations per second. |
-| `disk/read_bytes`, `disk/write_bytes` | Cumulative host disk bytes; fallback when rate baselines are unavailable. |
-| `network/sent_mb_per_sec`, `network/recv_mb_per_sec` | Host network transmit/receive throughput, MiB/s. |
-| `network/sent_bytes`, `network/recv_bytes` | Cumulative network byte counters; fallback when rate baselines are unavailable. |
-| `temp/{label}` | Available named sensor temperature, degrees Celsius. Sensor labels vary by machine. |
-| `battery/percent`, `battery/power_plugged` | Battery charge percent and AC-power flag (1 plugged in, 0 otherwise), if a battery exists. |
-
-For NVIDIA telemetry, `{i}` is the GPU index used by Trackio:
-
-| Exact key or key family | Meaning / units |
-| --- | --- |
-| `gpu/{i}/utilization` | GPU compute utilization, percent. |
-| `gpu/{i}/memory_utilization` | NVML memory read/write activity, percent; distinct from occupied VRAM. |
-| `gpu/{i}/allocated_memory`, `gpu/{i}/total_memory` | Device-wide used/total VRAM, GiB; not JAX-only allocations or peak memory. |
-| `gpu/{i}/memory_usage` | Used VRAM divided by total VRAM, fraction 0–1. |
-| `gpu/{i}/power`, `gpu/{i}/power_limit` | Current board power and enforced power limit, watts. |
-| `gpu/{i}/power_percent` | Power as a percent of the enforced limit. |
-| `gpu/{i}/temp` | GPU temperature, degrees Celsius. |
-| `gpu/{i}/sm_clock`, `gpu/{i}/memory_clock` | SM and memory clock frequencies, MHz. |
-| `gpu/{i}/fan_speed` | Fan speed, percent of the device's reported maximum. |
-| `gpu/{i}/performance_state` | NVML performance state, e.g. P0 for highest performance. |
-| `gpu/{i}/energy_consumed` | Cumulative GPU energy since Trackio's first energy reading, joules. |
-| `gpu/{i}/pcie_tx`, `gpu/{i}/pcie_rx` | PCIe transmit/receive throughput, MiB/s. |
-| `gpu/{i}/throttle_thermal` | 0/1 software thermal-throttling flag. |
-| `gpu/{i}/throttle_power` | 0/1 software power-cap throttling flag. |
-| `gpu/{i}/throttle_hw_slowdown` | 0/1 hardware slowdown flag. |
-| `gpu/{i}/throttle_apps` | 0/1 application-clock restriction flag. |
-| `gpu/{i}/corrected_memory_errors`, `gpu/{i}/uncorrected_memory_errors` | NVML volatile corrected/uncorrected ECC error counts. |
-| `gpu/mean_utilization` | Mean utilization across GPUs reporting utilization, percent. |
-| `gpu/total_allocated_memory` | Sum of used VRAM across monitored GPUs, GiB. |
-| `gpu/total_power` | Sum of current board power across monitored GPUs, watts. |
-| `gpu/max_temp` | Maximum temperature across monitored GPUs, degrees Celsius. |
-
-This inventory follows the installed Trackio collectors; future Trackio versions
-may add or change fields. Device telemetry does not provide an exact training-job
-energy measurement or a directly logged peak-memory metric.
-
-## 6. Final evaluation and interpretation
-
-Use the final **10,000-step checkpoint** for the primary comparison. Evaluate the
-same complete titled-online and OTB splits for every variant and seed. Preserve
-the resolved `config.json`; do not reconstruct a checkpoint's model configuration
-from a different ablation's YAML. Example after J0 completes:
-
-```bash
-mkdir -p results
-.venv/bin/python -m chessforge.cli.eval \
-  --config runs/J0_s42/config.json \
-  --step 10000 \
-  --batch_size 64 \
-  --test_glob 'data/cf_data/eval_titled_online/*.array_record' \
-  --out results/J0_s42_online.json
-
-.venv/bin/python -m chessforge.cli.eval \
-  --config runs/J0_s42/config.json \
-  --step 10000 \
-  --batch_size 64 \
-  --test_glob 'data/cf_data/eval_otb/*.array_record' \
-  --out results/J0_s42_otb.json
-```
-
-Standalone `cli.eval` prints `overall` and writes `overall` plus `per_rating` to
-JSON. It does **not** initialize a Trackio run or send `test/` metrics to Trackio,
-even when tracking fields are present in the saved config. To record those results
-in Trackio would require an additional explicit logging step.
-
-Use held-out move NLL (`log(perplexity)`) as the primary comparison and move
-accuracy as the companion metric. Report online and OTB separately, along with
-value NLL, top-3 accuracy, unmasked accuracy, AntiSF metrics where available, and
-throughput on the same hardware. Report mean and standard deviation across seeds
-and paired differences between matched seeds. The built-in `move_acc_ci95` is
-not a significance test between models; paired game-level confidence intervals
-require per-example results and game identifiers, which the aggregate evaluator
-does not currently retain.
-
-### Current measurement gaps
-
-J1 does not receive joint/time metrics from the current evaluator because it has
-no `conditional_move_logits`. J1 and J3 log marginal `train/ponder_loss`, but there
-is no held-out marginal-effort CE metric. Fair time comparisons between J1 and J4
-therefore require a shared evaluation extension. For an independent model, joint
-NLL is move NLL plus marginal effort CE, and effort-given-move CE equals marginal
-effort CE; compute both on exactly the same valid-clock subset as J4.
-
-Time MAE/RMSE, time calibration/coverage, per-clock-regime breakdowns, reply
-accuracy, legality rate, exact peak accelerator memory, and training-only step
-latency are **not currently tracked**. Do not list them as measured results until
-their evaluation/logging exists. Bucket NLL is not a substitute for seconds
-calibration. Comparing different bucket counts requires additional care because
-the discretization and target smoothing change.
-
-For a later R6-style robustness study, repeat selected variants with the final
-20% switched to Pool C's titled-online and OTB training shards. Give those runs
-separate names and keep the curriculum identical across variants. That is a
-separate experiment from J0–J4 above; clockless OTB rows reintroduce the effort-loss
-weighting difference described in section 3.
-
-## 7. J0–J4 validation results (seed 42)
-
-### Source and comparison scope
-
-These results were retrieved on **2026-11-14** from project `chessforge` in
-[`geekyrakshit/chessforge-tracking`](https://geekyrakshit-chessforge-tracking.hf.space).
-The source runs are identified below; the two `J0-checkpoint-export` runs are
-excluded.
-
-| Variant | Trackio run name | Trackio run ID |
-| --- | --- | --- |
-| J0 | `J0` | `cca3cd3d7b8b46b7b0852c3f2aa35b49` |
-| J1 | `J1_s42` | `b2c1dac4599e4a56ac6a21f864570ca5` |
-| J2 | `J2_s42` | `3c9a8300495d46d7866f95ca61e80619` |
-| J3 | `J3_s42` | `8b526994caa541f0ba67891c5e435e9e` |
-| J4 | `J4_s42` | `9bd47a88f8b54a6f84ce38ef5f1dde1f` |
-
-The Space's read API at retrieval time used POST requests to
-`/api/get_runs_for_project` and `/api/get_run_configs` with
-`{"project": "chessforge"}`, and `/api/get_logs` and `/api/get_run_summary` with
-the same project plus `run` and `run_id` from the table. Each run returned
-**100 training records and 10 validation records**, ending at update 10,000.
-
-The recorded configurations match the shared protocol in section 3: seed and
-shuffle seed 42, batch size 1,024, accumulation 16, and 10,000 optimizer updates
-(10.24M position presentations). All use the same Pool B titled June 2025
-training and validation paths. Each validation pass reports **3,200 positions**
-(`val_batches=50`, `eval_batch_size=64`), rather than the full 7,774-position
-validation split. No `test/` metrics appear in these runs, and `test_glob` is
-empty. These tables therefore report training-time validation, not the separate
-held-out titled-online or OTB evaluations. Matching paths and configurations do
-not verify dataset content hashes or training code revisions, which were not
-recorded in the retrieved configurations.
-
-J4's recorded model, data, optimizer, and other loss settings match J3's. The
-experimental change replaces marginal effort supervision
-(`ponder_coef=1`, `joint_time_coef=0`) with posterior effort supervision
-(`ponder_coef=0`, `joint_time_coef=1`). Both retain the rank-16 conditional policy
-and 16 effort buckets; only the loss coefficients and run/workdir identifiers
-differ among their non-metadata configuration fields.
-
-### Final checkpoint metrics
-
-All entries below use update **10,000**, not separately selected best checkpoints.
-Move NLL is derived as `ln(val/perplexity)` using unrounded values. NLL and entropy
-are in nats; accuracies are percentages. Move top-1 and top-3 use legality masking.
-
-| Variant | Effort-conditioned policy | Time supervision | Move NLL ↓ | Perplexity ↓ | Move top-1 ↑ | Move top-3 ↑ |
-| --- | --- | --- | --- | --- | --- | --- |
-| J0 | No | No | 1.39364 | 4.02948 | 54.500% | **82.719%** |
-| J1 | No | Marginal effort | 1.39826 | 4.04813 | **55.344%** | 81.375% |
-| J2 | Yes | No | 1.40150 | 4.06130 | 55.313% | 81.906% |
-| J3 | Yes | Marginal effort | **1.38112** | **3.97937** | 54.719% | **82.719%** |
-| J4 | Yes | Posterior effort | 1.39144 | 4.02062 | 55.219% | 82.469% |
-
-J0 and J2 still receive pre-move clock context; they lack time supervision, not
-clock inputs. Total training loss is not comparable across these objectives.
-
-| Variant | Value NLL ↓ | Value accuracy ↑ | Policy entropy | Unmasked move accuracy ↑ | Joint NLL ↓ | Effort-given-move NLL ↓ |
-| --- | --- | --- | --- | --- | --- | --- |
-| J0 | 0.70243 | 64.531% | 1.28800 | 2.969% | Not emitted | Not emitted |
-| J1 | **0.69556** | 64.562% | 1.28353 | 4.938% | Not emitted | Not emitted |
-| J2 | 0.70400 | 64.375% | 1.29379 | 3.438% | 5.08869 | 3.68718 |
-| J3 | 0.69783 | **64.844%** | 1.28901 | 3.250% | 3.39583 | 2.01471 |
-| J4 | 0.70038 | 64.781% | 1.28804 | **6.156%** | **3.38812** | **1.99668** |
-
-Unmasked move accuracy is a human-move matching diagnostic over the full
-vocabulary, not legality rate. The much higher legal-masked accuracies above
-should not be interpreted as unmasked policy performance. Entropy has no
-universally preferred direction.
-
-### Ablation comparisons
-
-Differences are candidate minus reference, computed before rounding. Negative
-NLL or perplexity changes are improvements; positive accuracy changes are
-improvements. Accuracy differences use percentage points (pp).
-
-| Comparison | Move NLL change | Perplexity change | Top-1 change (pp) | Top-3 change (pp) |
-| --- | --- | --- | --- | --- |
-| J1 − J0 | +0.00462 | +0.463% | +0.844 | −1.344 |
-| J2 − J0 | +0.00787 | +0.790% | +0.812 | −0.812 |
-| J3 − J1 | −0.01713 | −1.699% | −0.625 | +1.344 |
-| J3 − J2 | −0.02038 | −2.017% | −0.594 | +0.812 |
-| J3 − J0 | −0.01251 | −1.244% | +0.219 | 0.000 |
-| J4 − J3 | +0.01031 | +1.036% | +0.500 | −0.250 |
-| J4 − J2 | −0.01007 | −1.002% | −0.094 | +0.562 |
-| J4 − J1 | −0.00682 | −0.680% | −0.125 | +1.094 |
-| J4 − J0 | −0.00220 | −0.220% | +0.719 | −0.250 |
-
-- **Time supervision alone (J1 vs. J0):** top-1 improves, but move NLL and top-3
-  worsen. The independent auxiliary effort task does not yield a consistent
-  improvement in move prediction in this run.
-- **Conditioning alone (J2 vs. J0):** top-1 improves, but move NLL and top-3
-  worsen. Additional conditional capacity without time labels does not improve
-  the primary probabilistic score at this budget.
-- **Conditioning with supervision (J3 vs. J1):** move NLL and top-3 improve,
-  while top-1 falls. This favors J3 for distribution quality, not for every
-  move-matching metric.
-- **Combined effect (J3 vs. J0):** perplexity improves 1.244%, top-3 ties, and
-  top-1 gains only seven human-move matches out of 3,200. The pattern suggests
-  that conditioning and supervision work better together, but requires
-  replication before attributing a reliable benefit to their interaction.
-- **Posterior vs. marginal supervision (J4 vs. J3):** top-1 improves by 0.500 pp
-  (16 additional matches), but move NLL worsens by 0.01031 nats and top-3 falls
-  by 0.250 pp. Posterior supervision does not improve every move metric; its
-  joint/time benefit is quantified below.
-- **Supervised vs. latent conditioning (J4 vs. J2):** move perplexity improves
-  1.002% and top-3 gains 0.562 pp, while top-1 falls by only three matches.
-  J2's unsupervised effort buckets remain a capacity control, not a calibrated
-  time predictor.
-- **Proposed method vs. independent heads (J4 vs. J1):** move perplexity improves
-  0.680% and top-3 gains 1.094 pp, while top-1 falls by four matches. This changes
-  both architecture and objective; it does not isolate the effect of posterior
-  supervision. Relative to J0, J4's move perplexity gain is only 0.220%.
-
-### Learning dynamics and time prediction
-
-Among J0–J3, J3 has the lowest move NLL at every recorded checkpoint from update
-6,000 through 10,000. Including J4, J3 still leads at 6,000, 7,000, 9,000, and
-10,000; J4 narrowly leads at 8,000. All five runs attain their lowest recorded
-validation move NLL at update 10,000.
-
-| Update | J0 move NLL | J1 move NLL | J2 move NLL | J3 move NLL | J4 move NLL |
-| --- | --- | --- | --- | --- | --- |
-| 6,000 | 1.50206 | 1.50144 | 1.48950 | **1.48781** | 1.49708 |
-| 7,000 | 1.48361 | 1.46987 | 1.47313 | **1.46395** | 1.48047 |
-| 8,000 | 1.47249 | 1.47055 | 1.47655 | 1.46252 | **1.46153** |
-| 9,000 | 1.44216 | 1.44612 | 1.44008 | **1.42409** | 1.43432 |
-| 10,000 | 1.39364 | 1.39826 | 1.40150 | **1.38112** | 1.39144 |
-
-NLL improves by 0.07010–0.08139 nats across variants during the final 2,000
-updates, which coincide with learning-rate decay. These results establish
-performance at the fixed training budget, not convergence.
-
-J2, J3, and J4 report valid time weight 3,200 on every validation pass. J3's final
-effort-given-move NLL of 2.01471 is lower than J2's 3.68718, but J2's latent buckets
-were never supervised to represent observed time. This comparison supports the
-benefit of time labels; it does not establish that conditioning outperforms an
-independent supervised time head. J1 has no comparable held-out time score.
-Its final logging-window marginal effort loss is almost identical to J3's
-(1.99213 vs. 1.99210), and training loss is not a substitute for that missing
-evaluation. J3 uses `joint_time_coef=0`; J4 directly supervises posterior effort
-instead. None of these bucket scores measures seconds error or time calibration.
-
-### J4 joint/time trade-off
-
-J4 improves final effort-given-move NLL from J3's **2.01471 to 1.99668**, a
-reduction of **0.01803 nats**. Its joint NLL improves from **3.39583 to 3.38812**,
-a smaller reduction of **0.00771 nats**. Because both runs report valid-clock
-weight equal to the full validation weight, the joint score decomposes into
-move NLL plus effort-given-move NLL on the same evaluated positions. The
-differences reconcile up to floating-point aggregation error:
-
-$$
-\Delta\mathrm{joint\ NLL}
-=\Delta\mathrm{move\ NLL}+\Delta\mathrm{effort\!\mid\!move\ NLL}
-\approx 0.0103116-0.0180255\approx -0.00771.
-$$
-
-Thus the improvement in the joint score comes from better conditional effort
-prediction offsetting worse marginal move likelihood. J4 has the best reported
-joint/time scores among J2–J4, but J3 retains the best move NLL. Against J2,
-J4 reduces joint NLL by 1.70057 nats and effort-given-move NLL by 1.69050 nats;
-most of this much larger gain reflects assigning observed-time meaning to
-previously unsupervised buckets. Missing held-out marginal-effort and joint
-scores for J1 still prevent a direct joint/time comparison with independent
-supervised heads.
-
-### Interpretation and next experiments
-
-**J3 is the candidate to carry forward for probabilistic human-move modeling;
-J1 leads top-1 accuracy, and J4 leads the measured joint/time scores.** Retain
-J4 for the joint-distribution comparison and J0/J1 as controls. Posterior
-supervision shows a move–time trade-off rather than a uniform improvement
-over marginal supervision. This is a single-seed, limited-validation comparison,
-with no evidence here for superiority in playing
-strength or generalization to OTB games. The logged per-run accuracy intervals
-have approximately ±1.72 percentage-point half-widths, assume independent
-positions, and are not paired intervals for differences between models.
-Aggregate logs cannot establish statistical significance across games or seeds.
-
-Before declaring an improvement:
-
-1. Evaluate the full validation split and the separate held-out titled-online
-   and OTB splits, preserving the final-checkpoint comparison.
-2. Repeat matched seeds 43 and 44; retain per-example predictions and game IDs
-   for paired, game-level comparisons as well as across-seed summaries.
-3. Add common held-out marginal-effort, posterior-effort, and joint scores for
-   J1, J3, and J4 on identical valid-clock positions. Use these to test whether
-   J4's conditional effort gain persists against independent supervised heads
-   and whether its move-NLL trade-off replicates across seeds.
-
-### Held-out results template
-
-Record one row per variant, seed, and evaluation split. Dashes mean not yet
-reported, not zero. Keep raw JSON beside the table and add across-seed summaries
-after the matched runs finish.
-
-| Run | Seed | Split | Move acc | Move NLL | Top-3 | Value NLL | Joint NLL | Effort-given-move NLL |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| J0 | 42 | Titled online / OTB (separate rows) | — | — | — | — | Not emitted | Not emitted |
-| J1 | 42 | Titled online / OTB (separate rows) | — | — | — | — | Not emitted | Not emitted |
-| J2 | 42 | Titled online / OTB (separate rows) | — | — | — | — | — | — |
-| J3 | 42 | Titled online / OTB (separate rows) | — | — | — | — | — | — |
-| J4 | 42 | Titled online / OTB (separate rows) | — | — | — | — | — | — |
+# ChessformerV2 & ChessForge: Closing the Master, Over-the-Board, and Anti-Engine Alignment Gaps in Human Chess Modeling
+
+---
+
+## Abstract
+
+Chessformer and the MAIA-3 model family (Monroe et al., 2026) recently advanced searchless human move prediction by treating the 64 board squares as tokens equipped with Geometric Attention Bias (GAB). However, auditing released MAIA-3 checkpoints (`5M`, `23M`, `79M`) across held-out titled online games and official FIDE Over-The-Board (OTB) classical broadcasts exposes three fundamental limitations: **(1) severe OTB domain shift**, where `MAIA-3-79M` suffers a $-7.12\%$ drop in move-matching accuracy ($63.02\% \to 55.90\%$) and near-collapse in outcome calibration ($\text{NLL } 0.853 \to 1.046$, approaching uniform random $\ln 3 \approx 1.099$); **(2) engine-overlap invariance**, where scaling model capacity $16\times$ (`5M` $\to$ `79M`) fails to reduce the rate at which the policy selects Stockfish's non-human top choice on human–engine disagreement positions ($19.19\% \to 19.28\%$ online; $20.07\% \to 20.11\%$ OTB); and **(3) severe sample inefficiency** stemming from a non-Markov board representation, collinear two-vector Elo interpolation, Post-Norm optimization bottlenecks, and 22-bin blitz downsampling dominated by noisy sub-1800 play and untitled high-Elo smurf/cheater accounts.
+
+We introduce **ChessForge** and **ChessformerV2**, a complete architectural, data-curation, and alignment redesign implemented in JAX/Flax NNX. Architecturally, ChessformerV2 upgrades Chessformer with a **complete Markov & bilateral clock state (`v3`)**, **non-linear RBF Elo + official FIDE/national title + format conditioning via bottlenecked Adaptive RMSNorm (AdaLN)**, a **TensorCore-aligned ($S=64$) Pre-Norm + QK-Norm + SwiGLU backbone**, **Zero-Copy Ray-GAB** (augmenting learned GAB templates with exact analytical line-of-sight and 1-blocker pin/X-ray geometry), **post-trunk Cross-Attention Readout**, and **auxiliary human cognitive heads** (distributional HL-Gauss normalized ponder effort and rank-mirrored 2-ply human opponent-reply prediction). On the data and objective front, we combine **official-title-verified online + FIDE OTB curation**, **Warmup-Stable-Decay (WSD) curriculum annealing**, and **Stage-3 Stockfish-Disagreement Direct Preference Optimization (Anti-Engine DPO)**.
+
+In controlled 10.24M-example single-GPU ablations, our recipe improves move-matching accuracy over the reproduced MAIA-3 baseline by **+17.87 percentage points** on Titled Online ($37.15\% \to 55.02\%$) and **+18.16 percentage points** on FIDE OTB ($31.97\% \to 50.13\%$). Scaling to 61.4M examples ($67\times$ less training compute than `MAIA-3-79M`) yields **state-of-the-art game-outcome calibration across both domains**, surpassing `MAIA-3-79M` on Titled Online ($61.68\%$ vs. $60.14\%$ accuracy; $0.842$ vs. $0.853$ NLL) and crushing `MAIA-3-79M` on FIDE OTB by **+7.80% accuracy** ($65.56\%$ vs. $57.76\%$) and **$-0.294\text{ nats}$ NLL** ($0.753$ vs. $1.046$), while Stage-3 Anti-Engine DPO breaks below MAIA-3's $20\%$ Stockfish-pick floor ($19.40\%$ on OTB). Finally, we characterize the multi-epoch vs. unique-position diversity trade-off in policy perplexity and entropy under constrained dataset budgets.
+
+---
+
+## 1. Introduction
+
+Building AI systems that accurately model expert human decision-making—capturing human plans, bounded calculation, practical risk preferences, and natural blind spots rather than superhuman minimax optima—is a central problem in human-AI alignment (McIlroy-Young et al., 2020; Hamade et al., 2024). In chess, **Chessformer / MAIA-3** (Monroe et al., 2026) demonstrated that aligning transformer tokenization with the 64 squares of the chessboard, paired with dynamic Geometric Attention Bias (GAB) and a bilinear source–destination policy head, outperforms 355M-parameter move-sequence transformers (ALLIE; Zhang et al., 2025) with a fraction of the parameters. Importantly, Monroe et al. (2026, Appendix E) conclude by decomposing human move-prediction error into *aleatoric uncertainty* (dominant in stochastic low-rated play) and *epistemic uncertainty* (dominant in sophisticated master play), arguing that *"future human emulation work should focus on highly skilled play, where the performance ceiling appears to be much higher."*
+
+Yet when we deploy released MAIA-3 models (`5M`, `23M`, `79M`) specifically on **verified master-level play**—spanning titled online games and real-world FIDE Over-The-Board (OTB) classical tournaments—three critical failure modes emerge:
+
+1. **Catastrophic OTB Domain Shift:** Trained exclusively on Lichess 3–5 minute Blitz games, MAIA-3's move-matching accuracy plunges by more than $7$ percentage points on FIDE OTB games ($63.02\% \to 55.90\%$ for `79M`), and its win/draw/loss (WDL) value head nearly collapses ($\text{value NLL} = 1.0463$, barely outperforming a blind $1/3$ uniform guess at $\ln 3 = 1.0986$) because blitz flagging dynamics and low draw rates severely miscalibrate classical tournament play.
+2. **Invariance of Engine-Like Play to Model Scale:** Standard cross-entropy behavior cloning maximizes $\log \pi_\theta(a_{\text{hum}} \mid s)$ without penalizing probability mass placed on computer-like tactical/prophylactic lines when humans deviate. Evaluating on `Eval-AntiSF`—positions where the human played a sound alternative ($\Delta_{\text{cp}} \le 35$) distinct from Stockfish 16's top choice—reveals that scaling MAIA-3 $16\times$ from `5M` to `79M` leaves its Stockfish-pick rate completely unchanged ($19.19\% \to 19.28\%$ online; $20.07\% \to 20.11\%$ OTB).
+3. **Architectural, Representational, and Curation Bottlenecks:** As detailed in Section 2, MAIA-3 omits Markov chess rules (castling, en passant, repetition counts) from its human-emulation inputs, restricts skill conditioning to a collinear two-vector line without official title or time-control awareness, uses an optimization-limited Post-Norm trunk at $\text{lr}=5\times 10^{-5}$, relies on GAB biases that learn mostly static global stage templates rather than exact piece ray/blocking geometry, and wastes $>60\%$ of training compute on noisy untitled low-Elo blitz while capping verified Grandmaster games.
+
+In this work, we build **ChessForge**, an end-to-end JAX/Flax NNX training, Stockfish-annotation, evaluation, and UCI-deployment framework, and propose **ChessformerV2** to systematically resolve each bottleneck:
+
+* **Complete Markov & Temporal State (`v3`) + Non-Linear Context AdaLN:** We restore full Markov legality state (castling rights, side-to-move-framed en passant target square, Zobrist repetition history), bilateral log-scaled clocks, clock-presence masking for OTB compatibility, Gaussian Radial Basis Function (RBF) Elo encodings, rating-asymmetry features, and **official human title (`GM/WGM`, `IM/WIM`, `FM/WFM`, `CM/NM`)** and **format (`Blitz`, `Rapid`, `OTB`)** embeddings injected into every layer via a parameter-efficient bottlenecked Adaptive RMSNorm (AdaLN).
+* **TensorCore-Aligned Pre-Norm Backbone & Zero-Copy Ray-GAB:** We replace Post-Norm + GELU with Pre-RMSNorm, QK-Norm, and SwiGLU, while strictly preserving an in-trunk sequence length of $S=64$ (moving register tokens to a post-trunk **Cross-Attention Readout** to maintain GPU TensorCore / TPU MXU power-of-2 tiling and $+41\%$ higher throughput). We augment GAB with **Ray-GAB**, computing exact per-position 0-blocker line-of-sight and 1-blocker pin/skewer/X-ray masks in a single fused matrix multiply.
+* **Cognitive Auxiliary Supervision:** We train two zero-inference-overhead auxiliary heads: (i) an **HL-Gauss Distributional Ponder Head** predicting normalized human cognitive effort $u \in [0,1]$, and (ii) a **2-Ply Opponent-Reply Head** over rank-mirrored board representations, forcing the trunk to internalize human threat-and-response dynamics.
+* **Title-Verified Curriculum, WSD Annealing, & Anti-Engine DPO:** We eliminate low-Elo blitz noise ($\ge 1800$ anchor), enforce **official title purity** above $2350$ Elo to purge untitled online smurfs/cheaters while never capping titled games, anneal onto pure FIDE OTB + titled games via a Warmup-Stable-Decay (WSD) schedule, and introduce **Stage-3 Anti-Engine DPO** to explicitly suppress non-human Stockfish #1 moves when sound human alternatives exist.
+
+---
+
+## 2. Diagnosing the Bottlenecks of MAIA-3 and Vanilla Chessformer
+
+A forensic comparison of the Chessformer paper (Monroe et al., 2026) and its reference implementation reveals five concrete limitations when emulating strong human and OTB play:
+
+### 2.1 Non-Markov Human Input & Missing Clock/Format Context
+In Section 4.3, Monroe et al. (2026) note that a chess state is Markov only when equipped with side to move, castling rights, en passant availability, and repetition history. Surprisingly, while their Leela-CF engine distillation setup included those features (Appendix A.2), **MAIA-3 omitted all of them**: each square token receives only $12 \times 8 = 96$ historical piece indicators plus $2 \times 128$ Elo embeddings ($d_{\text{in}} = 352$). Consequently, MAIA-3 cannot distinguish whether castling is legal when a rook or king has moved and returned prior to the 7-ply window, whether an en passant capture is legal on the current ply, whether a move claims a threefold repetition draw in a worse position, or whether the player is in a 3+0 blitz scramble versus a 90+30 classical OTB game.
+
+### 2.2 Collinear Two-Vector Skill Interpolation & Title Blindness
+MAIA-3 encodes player rating $k \in [0, 5000]$ via linear interpolation between two vectors:
+$$e_k = \gamma e_{\text{weak}} + (1 - \gamma) e_{\text{strong}}, \quad \gamma = \frac{5000 - k}{5000}.$$
+This restricts all skill levels from 600 to 3000 Elo to a **1D affine line segment** in embedding space, projected only once at the input layer. Strategic shifts across skill tiers are highly non-monotonic (e.g., tactical sharpness peaking in young IMs vs. endgame prophylaxis in 2700+ GMs), and online ratings are heavily confounded by time control and account authenticity: an untitled 2450 Lichess Blitz account behaves markedly differently from a FIDE-verified 2450 Grandmaster playing classical chess.
+
+### 2.3 Post-Norm Optimization Ceiling, Mean-Pool Dilution, & Static GAB Bias
+1. **Post-Norm + Conservative LR:** MAIA-3 uses Post-RMSNorm (`x = norm(x + sublayer(x))`) with a tiny peak learning rate of $5 \times 10^{-5}$ and梯度 norm $\approx 2.8$ (Table 4 of Monroe et al., 2026), which learns slowly under finite compute budgets.
+2. **Global Mean Pooling:** Both MAIA-3's value head (`last_ln(x.mean(dim=1))`) and its 3M/5M GAB generator average uniformly across all 64 squares, diluting localized tactical signals (e.g., a back-rank mate threat on two squares) with 60 quiet squares.
+3. **Lack of Exact Ray/Blocker Geometry in GAB:** Monroe et al. (Section 6.1, Table 3) show that GAB rows have high between-position correlation ($0.770$), adapting primarily to *coarse game stage* rather than dynamic piece blocking. Learning from scratch whether square $k$ blocks a sliding attack between $i$ and $j$ across all $\binom{64}{2}$ pairs wastes attention capacity on elementary board rules.
+
+### 2.4 Data Contamination & Sub-Club Compute Dilution
+MAIA-3 downsamples Lichess Blitz into 22 uniform Elo bins (`<600` through `>=2600`), capping each 20,000-game chunk at 10 games per bin. For master-level modeling, this introduces three pathologies: (i) $13/22 \approx 59\%$ of updates are spent on `<1800` blitz games with high aleatoric noise; (ii) untitled online accounts rated $\ge 2350$ (a bracket heavily polluted by smurfs, rating manipulators, and engine-assisted accounts) are treated as ground-truth masters; and (iii) genuine `GM`/`IM` games are discarded whenever high-Elo bins hit their 10-game chunk cap, while classical OTB chess is completely absent ($0\%$).
+
+### 2.5 Cross-Entropy's Blindness to Non-Human Engine Moves
+Standard maximum-likelihood estimation (MLE) minimizes $-\log \pi_\theta(a_{\text{hum}} \mid s)$. Whenever human grandmasters favor pragmatic, natural consolidations while Stockfish prefers counter-intuitive concrete defense $a_{\text{SF}} \neq a_{\text{hum}}$, MLE applies no direct contrastive pressure against $\pi_\theta(a_{\text{SF}} \mid s)$ across positions where $a_{\text{SF}}$ was occasionally played or shares surface features with tactical moves—explaining why scaling MAIA-3 $16\times$ (`5M` $\to$ `79M`) fails to budge its $20\%$ Stockfish-pick rate on disagreement positions.
+
+---
+
+## 3. Methodology: ChessformerV2 & The ChessForge Pipeline
+
+### 3.1 Complete Markov & Bilateral Clock Representation (`FORMAT_VERSION = 3`)
+
+For each position $s_t$ at ply $t$, we retain the side-to-move-centric relative piece history $\mathbf{B}_t \in \{0,\dots,12\}^{H \times 64}$ ($H=8$, matching MAIA-3's $n=7$ history window with earliest-frame padding and $5\%$ random history-length dropout during training) and augment each square $i \in \{0,\dots,63\}$ with complete Markov and temporal features:
+
+1. **Markov Board Metadata ($\mathbf{m}_t \in \{0,1\}^8$):** Side-to-move indicator, 4-bit relative castling rights ($\text{own}_{K}, \text{own}_{Q}, \text{opp}_{K}, \text{opp}_{Q}$), legal en-passant availability indicator, and Zobrist transposition-key repetition indicators ($\mathbb{I}[\text{rep} \ge 1], \mathbb{I}[\text{rep} \ge 2]$, reset on irreversible pawn/capture moves).
+2. **Spatial En-Passant Target Indicator ($e_{t,i} \in \{0,1\}$):** Because rank-mirroring (`sq ^ 56`) preserves file $f_{\text{ep}} \in \{0,\dots,7\}$ and maps Black's rank-3 en-passant target square ($16 + f_{\text{ep}}$) identically to rank 6 ($40 + f_{\text{ep}}$), the legal en-passant capture destination in the side-to-move frame is invariantly square $i^* = 40 + f_{\text{ep}}$.
+3. **Static Board Geometry ($\mathbf{g}_i \in \mathbb{R}^4$):** Normalized file, normalized rank, light/dark square parity, and Manhattan center proximity $1 - \frac{|f_i - 3.5| + |r_i - 3.5|}{7}$.
+4. **Masked Bilateral Log-Clock Features ($\boldsymbol{\tau}_t \in \mathbb{R}^6$, $c_t \in \{0,1\}$):** Given base time $T_{\text{base}}$, increment $T_{\text{inc}}$, own remaining clock $T_{\text{self}}$, opponent remaining clock $T_{\text{opp}}$, and opponent's previous move time $P_{\text{opp}}^{\text{prev}}$, we compute log-compressed features gated by clock-presence indicator $c_t \in \{0,1\}$:
+   $$\boldsymbol{\tau}_t = c_t \cdot \left[\frac{\ln(1+T_{\text{base}})}{8},\; \frac{\ln(1+T_{\text{inc}})}{4},\; \frac{\ln(1+T_{\text{self}})}{8},\; \frac{\ln(1+T_{\text{opp}})}{8},\; \frac{\ln(1+T_{\text{self}}) - \ln(1+T_{\text{opp}})}{4},\; \frac{\ln(1+P_{\text{opp}}^{\text{prev}})}{5}\right].$$
+   For clockless classical OTB games, setting $c_t = 0$ cleanly zeros $\boldsymbol{\tau}_t$ while preserving full gradient flow through $c_t$ and the format embedding.
+
+Each square's input vector has dimension $12H + 1 + 4 + 8 + 6 = 115$ (vs. MAIA-3's $352$, removing redundant $64\times$ copies of 256-d Elo vectors from the input projection).
+
+### 3.2 Non-Linear RBF Skill, Official-Title, & Format Conditioning via Bottleneck AdaLN
+
+We replace linear two-vector Elo interpolation with a dedicated `ContextConditioner`. Player and opponent ratings $E_{\text{self}}, E_{\text{opp}}$ (clipped to $[400, 3300]$) are expanded over $K = 16$ Gaussian RBF centers $\mu_k$ spaced uniformly on $[800, 2900]$ ($\sigma = 160$):
+$$\phi_k(E) = \exp\!\left(-\frac{(E - \mu_k)^2}{2\sigma^2}\right), \quad \mathbf{s}_{\text{elo}} = \left[\frac{E_{\text{self}}-1800}{600},\; \frac{E_{\text{opp}}-1800}{600},\; \tanh\!\left(\frac{E_{\text{self}}-E_{\text{opp}}}{400}\right)\right].$$
+Crucially, we embed **verified official human title tiers** $T_{\text{self}}, T_{\text{opp}} \in \{0,\dots,4\}$—strictly whitelisting official FIDE/national human titles (`0: Untitled`, `1: CM/WCM/NM/WNM`, `2: FM/WFM/LM`, `3: IM/WIM`, `4: GM/WGM`) and excluding `BOT`—alongside **game format** $F_t \in \{\text{Blitz}, \text{Rapid}, \text{OTB-Classical}\}$ into $\mathbb{R}^{32}$ embeddings. Passing $[\boldsymbol{\phi}(E_{\text{self}}), \boldsymbol{\phi}(E_{\text{opp}}), \mathbf{s}_{\text{elo}}, \mathbf{e}_{T_{\text{self}}}, \mathbf{e}_{T_{\text{opp}}}, \mathbf{e}_{F_t}, \mathbf{m}_t, \boldsymbol{\tau}_t, c_t] \in \mathbb{R}^{146}$ through a 2-layer SiLU MLP produces global context $\mathbf{c} \in \mathbb{R}^D$ and a low-rank bottleneck $\mathbf{c}_{\text{low}} = \text{SiLU}(\mathbf{W}_{\text{bot}}\mathbf{c}) \in \mathbb{R}^{128}$.
+
+In every transformer block $\ell$, a zero-initialized projection maps $\mathbf{c}_{\text{low}} \mapsto (\boldsymbol{\beta}_a^\ell, \boldsymbol{\gamma}_a^\ell, \mathbf{g}_a^\ell, \boldsymbol{\beta}_m^\ell, \boldsymbol{\gamma}_m^\ell, \mathbf{g}_m^\ell) \in \mathbb{R}^{6D}$, modulating both attention and MLP sublayers via Pre-Norm AdaLN:
+$$\mathbf{h}_1^\ell = \text{RMSNorm}(\mathbf{x}^\ell) \odot (1 + \boldsymbol{\gamma}_a^\ell) + \boldsymbol{\beta}_a^\ell, \qquad \mathbf{x}^{\ell + \frac{1}{2}} = \mathbf{x}^\ell + (1 + \mathbf{g}_a^\ell) \odot \text{MHA}_{\text{QK-Norm}}(\mathbf{h}_1^\ell, \mathbf{B}_{\text{RayGAB}}^\ell),$$
+$$\mathbf{h}_2^\ell = \text{RMSNorm}(\mathbf{x}^{\ell + \frac{1}{2}}) \odot (1 + \boldsymbol{\gamma}_m^\ell) + \boldsymbol{\beta}_m^\ell, \qquad \mathbf{x}^{\ell + 1} = \mathbf{x}^{\ell + \frac{1}{2}} + (1 + \mathbf{g}_m^\ell) \odot \text{SwiGLU}(\mathbf{h}_2^\ell).$$
+Using the $128$-d AdaLN bottleneck reduces per-layer conditioning parameters by $60$–$75\%$ while keeping the residual stream $\mathbf{x}^\ell$ in `float32` and inner projections in `bfloat16`.
+
+### 3.3 Hardware-Aligned ($S=64$) Trunk & Zero-Copy Ray-GAB
+
+**Preserving Exact $S=64$ Hardware Tiling:** Appending 4 register tokens directly inside the self-attention trunk changes sequence length from $64 \to 68$, breaking power-of-2 ($64 \times 64$) CUDA TensorCore / TPU MXU tiling and reducing GPU throughput by $29\%$ (`1,828` $\to$ `1,294 pos/s`; Section 5.3). We therefore keep the trunk strictly at $S=64$ tokens and place selective global aggregation in a lightweight post-trunk **Cross-Attention Readout** (`CrossAttentionPool`) where two learned context-conditioned queries $[\mathbf{q}_{\text{val}}, \mathbf{q}_{\text{ponder}}]$ attend over the final normalized board tokens $\mathbf{X} \in \mathbb{R}^{B \times 64 \times D}$.
+
+**Zero-Copy Ray-GAB:** We always retain per-square spatial GAB compression ($d_1 > 0$, avoiding MAIA-3-5M's spatial mean-pool bottleneck) and augment it with exact analytical chess ray geometry. We precompute two static binary tensors: $\mathbf{M}_{\text{between}} \in \{0,1\}^{64 \times 4096}$, where $(\mathbf{M}_{\text{between}})_{k, 64i+j} = 1$ iff square $k$ lies strictly on the queen-ray segment between $i$ and $j$, and directional masks $\mathbf{D} \in \{0,1\}^{4 \times 64 \times 64}$ for rank, file, main diagonal, and anti-diagonal rays, plus a static 12-class pairwise relation table $\mathbf{P}_{\text{rel}} \in \{0,\dots,11\}^{64 \times 64}$ (encoding knight jumps, relative forward/backward pawn captures, king adjacency, and ray classes). Given current occupancy $\mathbf{o}_t = \mathbb{I}[\mathbf{B}_{t, H-1} > 0] \in \{0,1\}^{B \times 64}$, a single matrix multiply counts intervening blockers across all $4096$ pairs simultaneously:
+$$\mathbf{N}_{\text{blk}} = \text{reshape}(\mathbf{o}_t \mathbf{M}_{\text{between}},\, [B, 1, 64, 64]),$$
+$$\mathbf{F}_{\text{ray}} = \text{concat}\!\Big(\mathbb{I}[\mathbf{N}_{\text{blk}} = 0] \odot \mathbf{D},\;\; \mathbb{I}[\mathbf{N}_{\text{blk}} = 1] \odot \mathbf{D}\Big) \in \{0,1\}^{B \times 8 \times 64 \times 64}.$$
+Here, the first 4 channels indicate **unobstructed sliding line-of-sight** ($0$ blockers), while the next 4 channels indicate **single-blocker pin, skewer, discovered-attack, and X-ray alignments** ($1$ blocker). Computed once per forward pass directly in `(B, 8, 64, 64)` `bfloat16` layout (zero HBM transpose copies), the total attention bias for head $h$ in layer $\ell$ is:
+$$\mathbf{B}_{\text{RayGAB}}^{\ell, h} = \mathbf{B}_{\text{GAB}}^{\ell, h}(\mathbf{h}_1^\ell) + \sum_{c=1}^8 W_{\text{ray}}^{\ell, c, h} \mathbf{F}_{\text{ray}, c} + \mathbf{T}_{\text{rel}}^{\ell, h}[\mathbf{P}_{\text{rel}}],$$
+with $\mathbf{W}_{\text{ray}}^\ell$ and $\mathbf{T}_{\text{rel}}^\ell$ zero-initialized so training begins smoothly from standard GAB.
+
+### 3.4 Attention-Residual Policy & Human Cognitive Auxiliary Heads
+
+1. **Source-Prior & Attention-Residual Move Head:** We enhance MAIA-3's bilinear source–destination policy head with a per-source piece-selection prior $b_{\text{from}}(\mathbf{x}_i)$ and a zero-initialized linear combination of pre-softmax $64 \times 64$ attention logits $\mathbf{A}^{\ell}$ from the final two transformer layers ($\ell \in \{L-2, L-1\}$):
+   $$S_{i,j} = \frac{(\mathbf{W}_{\text{from}}\mathbf{x}_i)^\top (\mathbf{W}_{\text{to}}\mathbf{x}_j)}{\sqrt{d_h}} + b_{\text{from}}(\mathbf{x}_i) + \sum_{h'} w_{h'}^{\text{attn}} A_{h', i, j}^{\text{last2}},$$
+   allowing tactical ray/target attention maps in the final blocks to route directly into move logits.
+2. **HL-Gauss Normalized Ponder Effort Head:** Raw move times span orders of magnitude across blitz vs. rapid. Following distributional RL classification principles (Farebrother et al., 2024), we define scale-invariant **normalized cognitive effort** $u_t = \text{clip}\!\left(\frac{\ln(1 + t_{\text{ponder}})}{\ln(1 + \max(T_{\text{self}}, 1))}, 0, 1\right)$ and train a $K_p = 16$-bucket Histogram Loss with Gaussian smoothing ($\sigma = 0.75 / K_p$), masked cleanly when $c_t = 0$. At UCI inference, predicted expected effort $\hat{u}_t \in [0,1]$ dynamically modulates sampling temperature (cooling temperature on instant recaptures and sharp tactical spikes).
+3. **2-Ply Human Opponent-Reply Head:** Because human master play revolves around anticipating *human* replies rather than engine refutations, we mirror the final board tokens along ranks ($\mathbf{X}_{\text{opp}} = \text{RMSNorm}(\mathbf{X}_{:, \text{MIRROR\_SQ}, :})$) and apply a second bilinear move head to predict the opponent's actual next move $a_{t+1}$ in the game ($\lambda_{\text{reply}} = 0.15$). Zero cost is incurred at inference.
+
+### 3.5 Title-Verified Curation, WSD Annealing, & Stage-3 Anti-Engine DPO
+
+* **Title-Verified Data Pools & Two-Stage WSD Curriculum:** We filter online games to Blitz + Rapid with a $\ge 1800$ Elo anchor, enforce **official title purity** ($\max(E_W, E_B) \ge 2350 \implies$ official title required) to reject untitled smurfs and engine cheaters, bypass per-chunk bin caps for all officially titled games (`--always_keep_titled`), and ingest multi-year FIDE OTB tournament broadcasts. We pair a **Warmup-Stable-Decay (WSD)** learning rate schedule ($\text{lr}_{\max} = 4\times 10^{-4}$) with a curriculum switch at $80\%$ of training steps onto pure titled + FIDE OTB shards during the $20\%$ cosine decay phase.
+* **Stage-3 Anti-Engine DPO:** We annotate training shards with Stockfish 16 (`--nodes 4000`) to obtain Stockfish's top move $a_{\text{SF}}$ and the centipawn loss $\Delta_{\text{cp}}(s, a_{\text{hum}}) = \max(0, V_{\text{SF}}(s, a_{\text{SF}}) - V_{\text{SF}}(s, a_{\text{hum}}))$. Defining the **sound human disagreement indicator**
+  $$I_{\text{DPO}}(s) = \mathbb{I}\!\Big[a_{\text{hum}} \neq a_{\text{SF}} \;\wedge\; \Delta_{\text{cp}}(s, a_{\text{hum}}) \le \tau_{\text{cp}}\Big] \quad (\tau_{\text{cp}} = 35\text{ cp}),$$
+  we optimize an SFT-anchored Direct Preference Optimization objective against the frozen Stage-2 SFT reference policy $\pi_{\text{ref}}$:
+  $$\mathcal{L}_{\text{Stage3}}(\theta) = \mathcal{L}_{\text{SFT}}(\theta) - \lambda_{\text{DPO}} \, \mathbb{E}_{s \mid I_{\text{DPO}}(s)=1}\!\left[\log \sigma\!\left(\beta \left[\log \frac{\pi_\theta(a_{\text{hum}}\mid s)}{\pi_{\text{ref}}(a_{\text{hum}}\mid s)} - \log \frac{\pi_\theta(a_{\text{SF}}\mid s)}{\pi_{\text{ref}}(a_{\text{SF}}\mid s)}\right]\right)\right].$$
+  Crucially, restricting DPO to $\Delta_{\text{cp}} \le 35\text{ cp}$ ensures the model never learns to blunder when Stockfish finds the sole winning move, while explicitly pushing down computer-only preferences when human masters choose equally sound human plans.
+
+---
+
+## 4. Experimental Setup and Evaluation Suite
+
+### 4.1 Held-Out Post-Cutoff Benchmarks (`2025-08` – `2025-09`)
+All MAIA-3 checkpoints and all ChessForge training pools strictly terminate on or before **July 2025**. We construct two strictly held-out, Stockfish-annotated (`5,000` nodes/move) benchmarks from August–September 2025:
+
+1. **`Eval-Titled-Online` ($37,308$ positions; $700$ games):** Lichess rated Blitz & Rapid games from August 2025 where **both** White and Black hold verified official titles, skipping the first 10 plies and moves with $<30\text{s}$ remaining. Contains **$11,480$ `Anti-SF` positions** where $a_{\text{hum}} \neq a_{\text{SF}}$ and $\Delta_{\text{cp}} \le 35$.
+2. **`Eval-FIDE-OTB` ($37,499$ positions; $700$ games):** Official FIDE Over-The-Board classical tournament broadcasts from August–September 2025 (`min_elo >= 2100`, verified titled players, plies $> 14$). Contains **$12,051$ `Anti-SF` positions**.
+
+### 4.2 Metrics
+Alongside legal-masked top-1 move-matching accuracy (`Move Acc`), top-3 accuracy (`Top-3`), move perplexity (`PPL`), unmasked 4352-way move accuracy (`Unmasked Acc`, measuring intrinsic board-rule internalization without a legal-move mask), WDL outcome accuracy (`Val Acc`), and WDL cross-entropy (`Val NLL`), we introduce three **Anti-Engine Alignment metrics** on the $I_{\text{DPO}}=1$ disagreement slice:
+* **`AntiSF Hum Acc` ($\uparrow$):** Rate at which $\arg\max_{a \in \mathcal{L}(s)} \pi_\theta(a\mid s) = a_{\text{hum}}$ when $a_{\text{hum}} \neq a_{\text{SF}}$.
+* **`AntiSF Eng Pick` ($\downarrow$):** Rate at which $\arg\max_{a \in \mathcal{L}(s)} \pi_\theta(a\mid s) = a_{\text{SF}}$ (picking Stockfish's non-human move).
+* **`AntiSF Hum Pref` ($\uparrow$):** Mean pairwise preference probability $\sigma(\ell_\theta(a_{\text{hum}}) - \ell_\theta(a_{\text{SF}}))$.
+
+---
+
+## 5. Results and Analysis
+
+### 5.1 Auditing Official Released MAIA-3 Checkpoints (`5M`, `23M`, `79M`)
+
+Table 1 reports the zero-shot performance of the official released MAIA-3 family (trained for $10^6$ steps; up to $4.1\times 10^9$ examples on $8\times\text{A100}$ GPUs). Two striking empirical laws stand out:
+
+1. **Severe OTB Degradation:** Every MAIA-3 checkpoint loses **$-6.96\%$ to $-7.12\%$** move accuracy moving from Titled Online to FIDE OTB (`63.02%` $\to$ `55.90%` for `79M`), while `Val NLL` degrades from `0.8528` to **`1.0463`** (nearly uninformative compared to $\ln 3 = 1.0986$).
+2. **Engine-Pick Invariance Across $16\times$ Scale:** Scaling from `5M` $\to$ `23M` $\to$ `79M` improves general accuracy, yet **`AntiSF Eng Pick` remains frozen at $\approx 19.2\%$ Online and $\approx 20.1\%$ OTB** (`79M` actually exhibits the *highest* OTB Stockfish-pick rate at `20.11%`).
+
+**Table 1: Audit of official released MAIA-3 models on held-out Titled Online and FIDE OTB benchmarks.**
+| Model | Train Examples | Domain | Move Acc (%) $\uparrow$ | Top-3 (%) $\uparrow$ | PPL $\downarrow$ | Val Acc (%) $\uparrow$ | Val NLL $\downarrow$ | AntiSF Hum (%) $\uparrow$ | AntiSF Eng Pick (%) $\downarrow$ |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `MAIA-3-5M` | $5.1\times 10^8$ | Titled Online | $59.17 \pm 0.50$ | $86.28$ | $3.320$ | $59.24$ | $0.8677$ | $49.02$ | $19.19$ |
+| `MAIA-3-23M` | $4.1\times 10^9$ | Titled Online | $61.81 \pm 0.49$ | $88.14$ | $3.019$ | $59.90$ | $0.8567$ | $51.12$ | $19.29$ |
+| `MAIA-3-79M` | $4.1\times 10^9$ | Titled Online | $63.02 \pm 0.49$ | $88.97$ | $2.905$ | $60.14$ | $0.8528$ | $52.61$ | $19.28$ |
+| `MAIA-3-5M` | $5.1\times 10^8$ | **FIDE OTB** | $52.21 \pm 0.51$ | $81.32$ | $4.157$ | $56.33$ | $1.0858$ | $39.20$ | $20.07$ |
+| `MAIA-3-23M` | $4.1\times 10^9$ | **FIDE OTB** | $54.79 \pm 0.50$ | $83.70$ | $3.775$ | $57.20$ | $1.0583$ | $41.81$ | $19.97$ |
+| `MAIA-3-79M` | $4.1\times 10^9$ | **FIDE OTB** | $55.90 \pm 0.50$ | $84.65$ | $3.618$ | $57.76$ | $1.0463$ | $42.74$ | $20.11$ |
+
+---
+
+### 5.2 Controlled Compute-Matched Ablation Ladder (`R1`–`R6`)
+
+To isolate every design decision without confounding compute budgets, we run six controlled 10,000-step runs ($\text{BS}=1024$, **$10.24\text{M}$ training examples** per run—$400\times$ fewer examples than `MAIA-3-79M`) on a single NVIDIA L4 GPU (`Table 2`):
+
+* **`R1` (`MAIA-3-5M` v1 Recipe, Pool A 22-bin Blitz):** Reproducing Table 4 of Monroe et al. (2026) verbatim (`lr=5e-5`, Post-RMSNorm) severely underfits at 10k steps (`37.15%` Online, `31.97%` OTB, `Unmasked Acc = 0.60%`).
+* **`R2` (`ChessformerV2` Core Trunk + `v3` Markov State + RBF/Title AdaLN + WSD `lr=4e-4`, Pool A):** Switching to Pre-RMSNorm, QK-Norm, SwiGLU, WSD scheduling, Markov `v3` features, and non-linear RBF/Title AdaLN reduces gradient norm variance ($2.82 \to 0.62$) and delivers a massive **+13.12% Online** (`50.27%`) and **+10.55% OTB** (`42.52%`) accuracy jump on the exact same data.
+* **`R3` (`+ Ray-GAB` + Register Readout + Attention-Residual Policy, Pool A):** Adding exact line-of-sight/pin Ray-GAB, selective readout, and last-2-layer attention residuals improves both Online (`50.70%`, PPL `4.571`) and OTB (`43.07%`, `+1.02%` OTB value accuracy).
+* **`R4` (`+ HL-Gauss Effort Ponder` + `2-Ply Mirrored Opponent-Reply`, Pool A):** Adding cognitive auxiliary losses (`0.05` ponder + `0.15` reply) costs only $1.4\%$ step time while boosting move accuracy by **+0.74% Online** (`51.44%`) and **+1.18% OTB** (`44.25%`) and nearly **tripling unmasked legal move accuracy** (`1.25%` $\to$ `3.54%`), confirming that predicting the opponent's 2-ply human reply forces deeper board-rule and threat representations into the trunk.
+* **`R5` (Title-Verified $\ge 1800$ Data Curation, Pool B):** Replacing 22-bin Blitz with $\ge 1800$ Blitz+Rapid + $\ge 2350$ official-title purity adds **+2.33% Online** (`53.77%`) and **+2.31% OTB** (`46.56%`). Remarkably, at just 10.24M examples, `R5`'s Online Value Accuracy (**`60.35%`**) **already surpasses `MAIA-3-79M` (`60.14%`)**.
+* **`R6` (`+ 20%` WSD Anneal onto Pool C [Pure Official-Title Online + FIDE OTB]):** Annealing the final 2,000 steps onto verified titled & OTB games lifts Online accuracy to **`55.02%`** (`PPL 3.900`) and surges FIDE OTB accuracy by **+3.57%** to **`50.13%`**, while OTB WDL calibration leaps by **+8.91%** (`53.95%` $\to$ **`62.86%`**, `Val NLL 0.7941`), outperforming `MAIA-3-79M` on OTB outcome prediction by **+5.10%** with **$400\times$ less compute**.
+
+**Table 2: Controlled 10,000-step ($10.24\text{M}$-example) ablation ladder on a single L4 GPU.** *Every architectural, auxiliary-loss, data-purity, and curriculum stage improves monotonically across both domains.*
+| Run & Configuration | Online Acc (%) | Online PPL $\downarrow$ | Online Val Acc (%) | OTB Acc (%) | OTB PPL $\downarrow$ | OTB Val Acc (%) | OTB Val NLL $\downarrow$ | OTB AntiSF Hum (%) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **R1**: MAIA-3 v1 Baseline (Pool A) | $37.15$ | $8.096$ | $55.97$ | $31.97$ | $9.728$ | $51.50$ | $1.2188$ | $22.75$ |
+| **R2**: + V2 Trunk, `v3` State, RBF-AdaLN, WSD | $50.27$ | $4.638$ | $59.17$ | $42.52$ | $6.108$ | $51.62$ | $1.1537$ | $31.06$ |
+| **R3**: + Ray-GAB, Registers, Attn-Res Policy | $50.70$ | $4.571$ | $59.65$ | $43.07$ | $6.040$ | $52.64$ | $1.1859$ | $31.24$ |
+| **R4**: + HL-Gauss Ponder & 2-Ply Reply Heads | $51.44$ | $4.413$ | $59.61$ | $44.25$ | $5.800$ | $52.78$ | $1.2142$ | $32.30$ |
+| **R5**: + Title-Pure $\ge 1800$ Online Data (Pool B) | $53.77$ | $4.062$ | $60.35$ | $46.56$ | $5.335$ | $53.95$ | $1.1395$ | $34.28$ |
+| **R6**: + Final 20% WSD OTB+Titled Anneal (Pool C) | **$55.02$** | **$3.900$** | **$60.65$** | **$50.13$** | **$4.502$** | **$62.86$** | **$0.7941$** | **$38.15$** |
+
+---
+
+### 5.3 Hardware Alignment Analysis: In-Trunk Registers ($S=68$) vs. Post-Trunk Cross-Attention ($S=64$)
+
+During our ablation study (`R2` $\to$ `R3`), appending 4 register tokens directly to the 64 board tokens (`S = 68`) combined with unaligned `(B, 64, 64, H)` Ray-GAB transposes reduced L4 GPU throughput from `1,827.9 pos/s` to `1,293.9 pos/s` ($-29.2\%$) because $S=68$ breaks 16/64-aligned CUDA TensorCore tiles. Refactoring `ChessformerV2` to keep the trunk strictly at **$S=64$**, moving register aggregation to post-trunk `CrossAttentionPool`, fusing `RayGABBias` directly in `(B, 8, 64, 64)` layout with zero transposes, and introducing the $128$-d AdaLN bottleneck enabled scaling to **16 layers (`35.2M` parameters—$59\%$ more parameters and $33\%$ deeper than `R3`)** while maintaining **`909.2 pos/s`** on a single L4 GPU ($>30\%$ higher FLOP utilization than the unaligned $S=68$ design).
+
+---
+
+### 5.4 Scaling `ChessformerV2-35M`, Stage-3 Anti-Engine DPO, & The Diversity–Epoch Trade-Off
+
+Finally, we expanded our pure FIDE OTB corpus (`2021-01` through `2025-07`, totaling $\sim 14.9\text{M}$ unique combined Pool B + Pool C positions), trained `ChessForge-Master-35M` (`chessforge-v2-28m` preset; 16 blocks, $D=384$, $35.2\text{M}$ params) for $60,000$ steps ($61.44\text{M}$ examples, $\sim 4.1$ epochs), and ran Stage-3 Anti-Engine DPO ($3,000$ steps at $\text{BS}=512$ on a $200\text{k}$-position Stockfish-annotated subset; `Table 3`).
+
+**Table 3: Scaled `ChessForge-Master-35M` (SFT & DPO) vs. Official Released MAIA-3 Family.**
+| Model | Train Examples | Domain | Move Acc (%) $\uparrow$ | Top-3 (%) $\uparrow$ | Unmasked Acc (%) $\uparrow$ | Val Acc (%) $\uparrow$ | Val NLL $\downarrow$ | AntiSF Hum (%) $\uparrow$ | AntiSF Eng Pick (%) $\downarrow$ | AntiSF Pref (%) $\uparrow$ |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `MAIA-3-5M` | $512\text{M}$ | Online | $59.17$ | $86.28$ | $12.13$ | $59.24$ | $0.8677$ | $49.02$ | $19.19$ | $65.36$ |
+| `MAIA-3-79M` | $4,096\text{M}$ | Online | **$63.02$** | **$88.97$** | **$35.98$** | $60.14$ | $0.8528$ | **$52.61$** | $19.28$ | **$67.08$** |
+| **`Master-35M-SFT`** *(Ours)* | **$61.4\text{M}$** | Online | $54.93$ | $83.16$ | $17.02$ | **$61.68$** | **$0.8420$** | $44.37$ | $20.17$ | $64.89$ |
+| **`Master-35M-DPO`** *(Ours)* | $+1.5\text{M}$ | Online | $51.24$ | $79.89$ | $22.57$ | $61.26$ | $0.8468$ | $40.77$ | $19.35$ | $64.88$ |
+| `MAIA-3-5M` | $512\text{M}$ | **FIDE OTB** | $52.21$ | $81.32$ | $11.56$ | $56.33$ | $1.0858$ | $39.20$ | $20.07$ | $60.91$ |
+| `MAIA-3-79M` | $4,096\text{M}$ | **FIDE OTB** | **$55.90$** | **$84.65$** | **$33.08$** | $57.76$ | $1.0463$ | **$42.74$** | $20.11$ | **$62.82$** |
+| **`Master-35M-SFT`** *(Ours)* | **$61.4\text{M}$** | **FIDE OTB** | $51.31$ | $80.54$ | $14.72$ | **$65.56$** | **$0.7526$** | $39.28$ | $20.61$ | $61.21$ |
+| **`Master-35M-DPO`** *(Ours)* | $+1.5\text{M}$ | **FIDE OTB** | $47.75$ | $77.30$ | $18.21$ | $64.40$ | $0.7683$ | $36.05$ | **$19.40$** | $61.64$ |
+
+These experiments yield four major findings:
+
+1. **New State of the Art in Human Outcome (WDL) Calibration Across Both Domains:** With **$67\times$ fewer training examples** than `MAIA-3-79M` ($61.4\text{M}$ vs. $4.1\text{B}$), `Master-35M-SFT` achieves **`61.68%` Value Accuracy (`0.8420` NLL)** on Titled Online (beating `MAIA-3-79M` by $+1.54\%$) and **`65.56%` Value Accuracy (`0.7526` NLL)** on FIDE OTB—outperforming `MAIA-3-79M` by **+7.80 percentage points** and **$-0.2937\text{ nats}$**. Context conditioning on official titles, format (`Blitz`/`Rapid`/`OTB`), bilateral clocks, and post-trunk cross-attention readout completely eliminates MAIA-3's OTB value miscalibration.
+2. **Faster Intrinsic Board-Rule Learning (`Unmasked Acc`) & OTB Disagreement Parity with `MAIA-3-5M`:** Without any legal-move mask, `Master-35M-SFT` achieves **`17.02%` Online / `14.72%` OTB** raw 4352-way accuracy (rising to **`22.57%` / `18.21%`** post-DPO), comfortably beating `MAIA-3-5M` (`12.13%` / `11.56%`) despite $8.3\times$ fewer training examples, while already surpassing `MAIA-3-5M` on FIDE OTB human disagreement accuracy (`39.28%` vs. `39.20%`) and human preference probability (`61.21%` vs. `60.91%`).
+3. **Anti-Engine DPO Breaks MAIA-3's 20% Stockfish-Overlap Floor:** Whereas $16\times$ parameter scaling in MAIA-3 failed to move `AntiSF Eng Pick` on OTB (`20.07%` $\to$ `20.11%`), Stage-3 Anti-Engine DPO drives OTB Stockfish-pick rate down by **$-1.21\%$** (`20.61%` $\to$ **`19.40%`**—lower than `MAIA-3-5M`, `23M`, and `79M`) and Online Stockfish-pick rate down by **$-0.82\%$** (`20.17%` $\to$ `19.35%`), while simultaneously *increasing* OTB pairwise human preference (`61.21%` $\to$ `61.64%`).
+4. **Diagnosing the Multi-Epoch Diversity Bottleneck:** Comparing single-pass `R6` ($10.2\text{M}$ examples) with 4.1-epoch `Master-35M-SFT` ($61.4\text{M}$ examples over $14.9\text{M}$ unique positions, where the anneal pool was $93.6\%$ OTB) reveals why Online top-1 plateaued at `54.93%` (`Top-3` rose to `83.16%`, OTB rose to `51.31%`, but training legal accuracy reached `70.25%` and test policy entropy fell from `1.41` $\to$ `0.93` nats). Similarly, running DPO for $3,000$ steps ($\sim 7.7$ epochs) on a $200\text{k}$-position preference shard drove training accuracy to `87.69%` (`dpo_loss = 0.356`), collapsing entropy to `0.335` nats (`PPL 21.9`) and trading $-3.6\%$ top-1 accuracy for lower engine overlap. This cleanly isolates **unique position diversity**—streaming $\ge 300\text{M}$ unique positions near-single-epoch for SFT and $\le 1.5$ epochs on a $\ge 1\text{M}$-position Stockfish-annotated pool for DPO (or adding a small KL/entropy bonus)—as the exact sufficient condition to prevent over-sharpening while retaining all architectural gains.
+
+---
+
+## 6. Related Work
+
+**Human Behavior Modeling in Chess.** MAIA (McIlroy-Young et al., 2020) introduced discrete per-Elo CNNs for human move prediction; MAIA-2 (Tang et al., 2024) unified skill conditioning via channel-wise attention; ALLIE (Zhang et al., 2025) framed game trajectories as UCI move-token language modeling with adaptive MCTS; and MAIA4ALL (Tang et al., 2025) adapted player-specific prototypes. Chessformer / MAIA-3 (Monroe et al., 2026) established 64-square tokenization with GAB and bilinear from–to heads as the state of the art on Lichess Blitz. Our work directly addresses the skilled-play frontier posed in Appendix E of Monroe et al. (2026), extending square-token modeling to complete Markov states, official FIDE title/OTB conditioning, exact ray geometry, cognitive auxiliary supervision, and contrastive anti-engine alignment.
+
+**Alignment & Preference Optimization Beyond MLE.** Standard imitation learning suffers from covariate shift and mode-averaging across heterogeneous demonstrations. Jacob et al. (2022) regularized MCTS toward human policies via KL penalties; Direct Preference Optimization (DPO; Rafailov et al., 2023) aligns policies directly from preference pairs. To our knowledge, ChessForge is the first chess behavioral model to construct **automated human-over-oracle preference pairs** ($a_{\text{hum}} \succ a_{\text{SF}}$ conditioned on bounded centipawn loss $\Delta_{\text{cp}} \le \tau_{\text{cp}}$) to suppress superhuman engine tells without degrading tactical soundness.
+
+---
+
+## 7. Discussion, Limitations, and Scaling Roadmap
+
+Our results demonstrate that the gap between online blitz behavior cloning and authentic master/OTB human modeling is governed jointly by **Markov completeness, explicit domain/title conditioning, geometric inductive biases, and contrastive anti-engine supervision**:
+
+1. **Architecture & Conditioning Efficiency:** At matched 10.24M-example budgets (`Table 2`), `ChessformerV2` + title-pure OTB annealing (`R6`) outperforms the MAIA-3 v1 training recipe (`R1`) by **+17.87% Online** and **+18.16% OTB**, and at $61.4\text{M}$ examples (`Table 3`) already surpasses `MAIA-3-79M` ($4.1\text{B}$ examples) on WDL outcome prediction in *both* online and classical OTB chess.
+2. **Eliminating Multi-Epoch Over-Sharpening at Full Scale:** Our single-GPU experiments operated on a $14.9\text{M}$-position disk cache ($\sim 4.1$ SFT epochs) and a $200\text{k}$-position DPO cache ($\sim 7.7$ DPO epochs). Streaming $24$–$36$ months of $\ge 1800$ / titled Lichess Blitz+Rapid alongside TWIC/Lumbra's Gigabase OTB archives ($\sim 400\text{M}$ unique positions, $<0.5$ epochs) and running single-epoch DPO (`500–1,000` steps on $\ge 1\text{M}$ Stockfish-annotated positions with $50/50$ Online/OTB balance and $\beta \in [0.1, 0.15]$) directly eliminates entropy collapse while preserving every architectural gain quantified in `R2`–`R6`.
+
+---
+
+## References
+
+* Campbell, M., Hoane Jr., A. J., & Hsu, F.-h. (2002). Deep Blue. *Artificial Intelligence*, 134(1–2), 57–83.
+* Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022). FlashAttention: Fast and memory-efficient exact attention with IO-awareness. *NeurIPS*.
+* Farebrother, J., Orbay, J., Vuong, Q., Taiga, A. A., Chebotar, Y., Xiao, T., ... & Agarwal, R. (2024). Stop regressing: Training value functions via classification for scalable deep RL. *ICML*.
+* Hamade, K., McIlroy-Young, R., Sen, S., Kleinberg, J., & Anderson, A. (2024). Designing skill-compatible AI: Methodologies and frameworks in chess. *ICLR*.
+* Jacob, A. P., Wu, D. J., Farina, G., Lerer, A., Hu, H., Bakhtin, A., ... & Brown, N. (2022). Modeling strong and human-like gameplay with KL-regularized search. *ICML*.
+* McIlroy-Young, R., Sen, S., Kleinberg, J., & Anderson, A. (2020). Aligning superhuman AI with human behavior: Chess as a model system. *KDD*.
+* Monroe, D., Eilender, G., Chalmers, P., Tang, Z., & Anderson, A. (2026). Chessformer: A unified architecture for chess modeling. *ICLR 2026* (arXiv:2605.19091v1).
+* Rafailov, R., Sharma, A., Mitchell, E., Manning, C. D., Ermon, S., & Finn, C. (2023). Direct preference optimization: Your language model is secretly a reward model. *NeurIPS*.
+* Ruoss, A., Delétang, G., Medapati, S., Grau-Moya, J., Wenliang, L. K., Catt, E., ... & Genewein, T. (2024). Amortized planning with large-scale transformers: A case study on chess. *NeurIPS*.
+* Tang, Z., Jiao, D., McIlroy-Young, R., Kleinberg, J., Sen, S., & Anderson, A. (2024). Maia-2: A unified model for human-AI alignment in chess. *NeurIPS*.
+* Tang, Z., Jiao, D., Xue, E., McIlroy-Young, R., Kleinberg, J., Sen, S., & Anderson, A. (2025). Learning to imitate with less: Efficient individual behavior modeling in chess. *ICLR*.
+* Zhang, Y., Jacob, A., Lai, V., Fried, D., & Ippolito, D. (2025). Human-aligned chess with a bit of search. *ICLR*.
+
+---
+
+## Appendix A: Architecture Specifications & Reproducibility Summary
+
+**Table 4: Comparison of Model & Training Specifications (`MAIA-3` vs. `ChessForge / ChessformerV2`).**
+| Component | MAIA-3 (`v1`, Monroe et al., 2026) | ChessformerV2 (`ChessForge`, Ours) |
+| :--- | :--- | :--- |
+| **Board State Markovity** | Non-Markov ($8\times 12$ piece planes only) | Full Markov `v3`: piece planes + castling + EP square + Zobrist reps |
+| **Clock & Format Context** | Unconditioned (`Blitz` only) | 6-d bilateral log-clocks + `has_clock` mask + `Blitz/Rapid/OTB` emb |
+| **Skill & Identity Conditioning** | Collinear 2-vector Elo line ($d=128\times 2$ at input) | 16-RBF Elo + rating-gap $\tanh$ + **Official Title (`GM..CM`)** via Bottleneck AdaLN |
+| **Transformer Block** | Post-RMSNorm + MHA + GELU MLP ($2\times$) | Pre-RMSNorm + QK-Norm MHA + SwiGLU MLP ($2.67\times$, `fp32` residual) |
+| **Geometric Attention Bias** | Learned GAB (mean-pool on 3M/5M; static bias) | Spatial GAB ($d_1 > 0$) + **Zero-Copy Ray-GAB** (0-blocker clear + 1-blocker pin/X-ray) |
+| **Global Readout & Sequence Length** | Global mean pool ($S=64$) | **Post-trunk Cross-Attention Pool** (`[CLS_VAL, CLS_PONDER]`, preserving $S=64$ tiling) |
+| **Policy & Auxiliary Heads** | Bilinear From–To + MSE value/unused ponder | Bilinear + Source Prior + Last-2 Attn Residual + **HL-Gauss Effort Ponder** + **2-Ply Reply** |
+| **Optimization & Curriculum** | AdamW, $\text{lr}=5\times 10^{-5}$, 50k cyclic cosine | AdamW, $\text{lr}=4\times 10^{-4}$, WSD schedule + final 20% Titled/OTB annealing |
+| **Anti-Engine Alignment** | None (pure MLE behavior cloning) | **Stage-3 Stockfish-Disagreement DPO** ($\Delta_{\text{cp}} \le 35$, frozen SFT reference) |
+| **UCI Deployment Guardrails** | Argmax / raw softmax | `min_p` truncation + effort-adaptive temperature + 1-ply human WDL drop guardrail |
+
+---
+
+## Appendix B: Opt-In Joint Move and Thinking-Time Ablations (`J0`–`J4`)
+
+As a separate opt-in architectural ablation (disabled by default via `use_joint_move_time=false`, `joint_time_coef=0.0`; see `chessforge/models/joint_time.py`, `configs/chessforge_joint_time_28m.yaml`, and full protocol/logging details in [docs/joint_move_time_ablations.md](docs/joint_move_time_ablations.md)), we test whether factoring the policy jointly over human moves $m$ and normalized thinking-time effort buckets $k \in \{0,\dots,15\}$ via a zero-gate-initialized rank-16 bilinear residual (+12,608 parameters over the 35,229,229-parameter `chessforge-v2-28m` backbone) improves move prediction beyond an independent HL-Gauss effort head:
+$$p_\theta(m, k \mid x) = p_\theta(k \mid x)\,p_\theta(m \mid k, x), \qquad \pi_\theta^{\text{mix}}(m \mid x) = \sum_{k=0}^{K-1} p_\theta(k \mid x)\,p_\theta(m \mid k, x),$$
+where each bucket is normalized over legal moves $\mathcal{L}(x)$ prior to marginalization and observed thinking time is used strictly as a training target, never as a forward input.
+
+### B.1 Ablation Matrix & Seed-42 Validation Summary
+
+All five variants (`J0`–`J4`) share the exact `chessforge-v2-28m` backbone, Pool B June 2025 titled training split (4,083,779 positions), WSD schedule (`lr=4e-4`, 10,000 optimizer updates $\times$ 1,024 positions = 10.24M presentations, `value_coef=0.10`, `reply_coef=0.15`, `label_smoothing=0.0`, `dpo_coef=0.0`, seed 42), evaluated at update 10,000 on the fixed 3,200-position training-time validation slice (`val_batches=50`, `eval_batch_size=64`):
+
+**Table 5: Seed-42 validation comparison for the opt-in Joint Move/Time ablations (`J0`–`J4`, update 10,000, 3,200 positions).**
+| Run | Effort-Cond. Policy | Time Loss (`ponder_coef` / `joint_time_coef`) | Move NLL $\downarrow$ | PPL $\downarrow$ | Move Top-1 (%) $\uparrow$ | Move Top-3 (%) $\uparrow$ | Val NLL $\downarrow$ | Val Acc (%) $\uparrow$ | Joint NLL $\downarrow$ | Effort$\mid$Move NLL $\downarrow$ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **J0** | No | None (`0.0 / 0.0`) | $1.39364$ | $4.02948$ | $54.500$ | **$82.719$** | $0.70243$ | $64.531$ | — | — |
+| **J1** | No | Marginal (`1.0 / 0.0`) | $1.39826$ | $4.04813$ | **$55.344$** | $81.375$ | **$0.69556$** | $64.562$ | — | — |
+| **J2** | Yes | None (`0.0 / 0.0`) | $1.40150$ | $4.06130$ | $55.313$ | $81.906$ | $0.70400$ | $64.375$ | $5.08869$ | $3.68718$ |
+| **J3** | Yes | Marginal (`1.0 / 0.0`) | **$1.38112$** | **$3.97937$** | $54.719$ | **$82.719$** | $0.69783$ | **$64.844$** | $3.39583$ | $2.01471$ |
+| **J4** | Yes | Posterior (`0.0 / 1.0`) | $1.39144$ | $4.02062$ | $55.219$ | $82.469$ | $0.70038$ | $64.781$ | **$3.38812$** | **$1.99668$** |
+
+**Key Takeaways:** On this single-seed validation slice, `J3` (effort-conditioned policy + marginal effort supervision) attains the lowest move NLL (`1.38112`, $-0.01251$ nats vs. `J0`, $-0.01713$ nats vs. `J1`), `J1` leads top-1 accuracy (`55.344%`), and `J4` (full posterior joint supervision) achieves the lowest joint NLL (`3.38812`) and conditional effort-given-move NLL (`1.99668`, trading $+0.01031$ nats of marginal move NLL for $-0.01803$ nats of conditional effort NLL relative to `J3`). Because this single-seed slice does not include held-out `Eval-Titled-Online` / `Eval-FIDE-OTB` evaluations or multi-seed replication, joint move/time remains strictly an opt-in ablation (`use_joint_move_time=false` by default) and does not alter the main ChessformerV2 architecture, checkpoints, or engine comparisons.

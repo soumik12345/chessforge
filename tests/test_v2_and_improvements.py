@@ -1,20 +1,25 @@
-"""Tests for official titles, OTB/v3 records, ChessformerV2, remat, WSD, and Anti-Engine DPO."""
+"""Tests for official titles, OTB/v3, ChessformerV2, DPO, and opt-in joint time."""
 
+import math
 from pathlib import Path
 
 import chess
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from flax import nnx
 
 from chessforge import chess_utils as cu
-from chessforge.config import DataConfig
+from chessforge.cli.uci import ChessforgeUCIEngine
+from chessforge.config import DataConfig, TrainConfig, load_train_config
 from chessforge.data import pgn, pipeline, records
 from chessforge.eval.evaluate import make_eval_step, run_eval
 from chessforge.models import build_model, build_model_config, forward_model
+from chessforge.models.joint_time import sample_joint_move_time
 from chessforge.train.losses import maia3_loss
 from chessforge.train.schedule import wsd_lr_schedule
+from chessforge.train.trainer import Trainer
 
 
 def test_official_titles_and_board_geometry():
@@ -149,10 +154,11 @@ def test_chessformer_v2_forward_grad_dpo_and_eval(tmp_path: Path):
     (loss_val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     assert np.isfinite(float(loss_val))
     assert "ponder_loss" in metrics and "reply_loss" in metrics and "dpo_loss" in metrics
+    assert "joint_time_loss" not in metrics and "joint_nll" not in metrics
     grad_norms = [float(jnp.linalg.norm(g)) for g in jax.tree.leaves(grads)]
     assert any(gn > 0.0 for gn in grad_norms)
 
-    # Verify Eval-AntiSF metrics populate cleanly
+    # Verify Eval-AntiSF metrics populate cleanly without leaking joint-time keys
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("data",))
     repl = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     dshard = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
@@ -167,7 +173,215 @@ def test_chessformer_v2_forward_grad_dpo_and_eval(tmp_path: Path):
     )
     assert res["overall"]["positions"] == 4
     assert res["overall"]["anti_sf_positions"] == 4
+    assert "joint_time_weight" not in res["overall"]
+    assert "joint_nll" not in res["overall"]
+    assert "effort_given_move_nll" not in res["overall"]
 
     sched = wsd_lr_schedule(4e-4, 1e-6, warmup=10, total_steps=100, decay_frac=0.2)
     assert float(sched(50)) == 4e-4
     assert float(sched(100)) < 1e-5
+
+
+def test_configs_and_tracking_backwards_compat():
+    cfg_dir = Path(__file__).resolve().parents[1] / "configs"
+    original_configs = [
+        "ablate_5m_relative.yaml",
+        "chessforge_master_28m.yaml",
+        "chessforge_master_dpo.yaml",
+        "maia3_5m.yaml",
+        "maia3_79m.yaml",
+    ]
+    for name in original_configs:
+        tcfg = load_train_config(
+            str(cfg_dir / name), ["wandb_project=chessforge-test"]
+        )
+        mcfg = build_model_config(tcfg.model, tcfg.model_overrides)
+        assert not mcfg.use_joint_move_time
+        assert tcfg.joint_time_coef == 0.0
+        assert tcfg.wandb_project == "chessforge-test"
+        assert tcfg.trackio_project == ""
+
+    jcfg = load_train_config(
+        str(cfg_dir / "chessforge_joint_time_28m.yaml"),
+        ["trackio_project=chessforge-ablation", "wandb_project=chessforge-test"],
+    )
+    jmcfg = build_model_config(jcfg.model, jcfg.model_overrides)
+    assert jmcfg.use_joint_move_time
+    assert jcfg.joint_time_coef == 1.0
+    assert jcfg.trackio_project == "chessforge-ablation"
+    assert jcfg.wandb_project == "chessforge-test"
+
+
+def test_joint_move_time_ablation_isolated(tmp_path: Path):
+    writer = pgn.ShardedWriter(str(tmp_path), "joint_v3", records_per_shard=4)
+    for i in range(4):
+        writer.write(
+            records.encode_position(
+                boards=np.ones((4, 64), np.int8),
+                n_hist=2,
+                stm=i % 2,
+                move=10 + i,
+                self_elo=2500,
+                oppo_elo=2450,
+                value=1,
+                ply=14 + i,
+                clk_left=120.0,
+                opp_clk_left=110.0,
+                ponder=0.5 + 10.0 * i,
+                prev_opp_ponder=2.0,
+                base_time=180,
+                increment=2,
+                castling=0b1111,
+                ep_file=-1,
+                rep_count=0,
+                self_title=cu.TITLE_GRANDMASTER,
+                oppo_title=cu.TITLE_GRANDMASTER,
+                game_format=cu.FORMAT_BLITZ,
+                has_clock=1,
+                next_move=20 + i,
+                legal=[10 + i, 30 + i, 40],
+            )
+        )
+    writer.close()
+
+    pattern = str(tmp_path / "*.array_record")
+    dcfg = DataConfig(train_glob=pattern, global_batch_size=4, history_mask_prob=0.0)
+    it, _ = pipeline.make_train_iterator(dcfg, history=4)
+    batch = next(it)
+
+    shared_overrides = {
+        "history": 4,
+        "num_blocks": 2,
+        "dim_vit": 64,
+        "head_hid_dim": 64,
+        "num_heads": 4,
+        "ponder_buckets": 4,
+        "compute_dtype": "float32",
+    }
+    base_cfg = build_model_config("chessforge-v2-5m", shared_overrides)
+    joint_cfg = build_model_config(
+        "chessforge-v2-5m",
+        {**shared_overrides, "use_joint_move_time": True, "joint_move_time_rank": 4},
+    )
+    base_model = build_model(base_cfg, rngs=0)
+    joint_model = build_model(joint_cfg, rngs=0)
+    base_def, base_params = nnx.split(base_model)
+    joint_def, joint_params = nnx.split(joint_model)
+
+    def _key_map(state):
+        out = {}
+        for path, val in jax.tree_util.tree_leaves_with_path(state):
+            k = tuple(
+                str(p.key if hasattr(p, "key") else getattr(p, "name", p)) for p in path
+            )
+            out[k] = np.asarray(val.value if hasattr(val, "value") else val)
+        return out
+
+    base_map = _key_map(base_params)
+    joint_map = _key_map(joint_params)
+    assert not any("effort_move_residual" in k for k in base_map)
+    assert any("effort_move_residual" in k for k in joint_map)
+    assert set(base_map) < set(joint_map)
+    for k, arr in base_map.items():
+        np.testing.assert_array_equal(arr, joint_map[k])
+
+    # Zero-initialized effort gates match the baseline legal policy at step 0
+    lm_base, lv_base, _ = forward_model(base_model, batch, deterministic=True)
+    lm_joint, lv_joint, _, aux_joint = forward_model(
+        joint_model, batch, deterministic=True, return_aux=True
+    )
+    expected_logp = jax.nn.log_softmax(
+        jnp.where(batch["legal"], lm_base.astype(jnp.float32), -1e9), axis=-1
+    )
+    np.testing.assert_allclose(
+        np.asarray(lm_joint), np.asarray(expected_logp), atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(lv_joint), np.asarray(lv_base), atol=1e-5, rtol=1e-5
+    )
+
+    def joint_loss_fn(p):
+        m = nnx.merge(joint_def, p)
+        lm, lv, lp, aux = forward_model(m, batch, deterministic=True, return_aux=True)
+        return maia3_loss(
+            lm, lv, lp, batch, aux=aux, value_coef=0.1, joint_time_coef=1.0
+        )
+
+    (loss_val, metrics), grads = jax.value_and_grad(joint_loss_fn, has_aux=True)(
+        joint_params
+    )
+    assert np.isfinite(float(loss_val))
+    assert "joint_time_loss" in metrics and "joint_nll" in metrics
+    effort_grads = [
+        float(jnp.linalg.norm(v))
+        for p, v in jax.tree_util.tree_leaves_with_path(grads)
+        if any(
+            str(k.key if hasattr(k, "key") else getattr(k, "name", k))
+            == "effort_move_residual"
+            for k in p
+        )
+    ]
+    assert any(gn > 0.0 for gn in effort_grads)
+
+    # Eval emits joint metrics only for joint models and obeys Bayes decomposition
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("data",))
+    repl = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    dshard = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+    eval_gen = lambda: (
+        jax.device_put(b, dshard)
+        for b in pipeline.eval_batches(pattern, history=4, global_batch_size=4)
+    )
+    base_res = run_eval(
+        make_eval_step(base_def, dshard, repl),
+        jax.device_put(base_params, repl),
+        eval_gen(),
+    )
+    joint_res = run_eval(
+        make_eval_step(joint_def, dshard, repl),
+        jax.device_put(joint_params, repl),
+        eval_gen(),
+    )
+    assert "joint_nll" not in base_res["overall"]
+    assert joint_res["overall"]["joint_time_weight"] == 4.0
+    move_nll = math.log(joint_res["overall"]["perplexity"])
+    np.testing.assert_allclose(
+        joint_res["overall"]["joint_nll"],
+        move_nll + joint_res["overall"]["effort_given_move_nll"],
+        atol=1e-5,
+    )
+
+    samples = sample_joint_move_time(
+        jax.random.PRNGKey(1),
+        aux_joint["ponder_logits"],
+        aux_joint["conditional_move_logits"],
+        batch["clk_left"],
+        batch["legal"],
+    )
+    for i, mv in enumerate(np.asarray(samples["move"])):
+        assert batch["legal"][i, int(mv)]
+
+    with pytest.raises(ValueError, match="use_joint_move_time"):
+        Trainer(
+            TrainConfig(
+                model="chessforge-v2-5m",
+                model_overrides={"use_joint_move_time": False},
+                joint_time_coef=1.0,
+                workdir=str(tmp_path / "bad_joint"),
+            )
+        )
+
+    # UCI batch construction adds legal masks only for joint models
+    board = chess.Board()
+    codes = [cu.board_codes(board)]
+    for use_joint in (False, True):
+        eng = ChessforgeUCIEngine.__new__(ChessforgeUCIEngine)
+        eng.model_cfg = build_model_config(
+            "chessforge-v2-5m", {"history": 4, "use_joint_move_time": use_joint}
+        )
+        eng.base_time = 180.0
+        eng.inc_time = 2.0
+        eng.game_format = cu.FORMAT_BLITZ
+        uci_batch = eng._make_single_batch(
+            board, codes, 0, 2500.0, 2500.0, 4, 4, 180.0, 180.0, 1.0
+        )
+        assert ("legal" in uci_batch) is use_joint

@@ -21,9 +21,18 @@ def make_eval_step(
 ):
     def step(params: nnx.State, batch: dict):
         model = nnx.merge(graphdef, params)
-        lm, lv, _, aux = forward_model(
-            model, batch, deterministic=True, return_aux=True
+        use_joint = bool(
+            getattr(getattr(model, "cfg", None), "use_joint_move_time", False)
         )
+        if use_joint:
+            lm, lv, _, aux = forward_model(
+                model, batch, deterministic=True, return_aux=True
+            )
+        else:
+            lm, lv, _ = forward_model(
+                model, batch, deterministic=True, return_aux=False
+            )
+            aux = {}
         lm = lm.astype(jnp.float32)
         lv = lv.astype(jnp.float32)
 

@@ -369,6 +369,17 @@ class Trainer:
             f"{o.total_steps * d.global_batch_size / max(n_total, 1):.2f} epochs"
         )
 
+        wandb = None
+        if cfg.wandb_project and jax.process_index() == 0:
+            import wandb as _wandb
+
+            wandb = _wandb
+            wandb.init(
+                project=cfg.wandb_project,
+                config=config_to_dict(cfg),
+                name=self.model_cfg.name,
+            )
+
         tracking_run = None
         if cfg.trackio_project and jax.process_index() == 0:
             import trackio
@@ -413,6 +424,8 @@ class Trainer:
                     log0(
                         f"step {step} " + " ".join(f"{k}={v:.5g}" for k, v in m.items())
                     )
+                    if wandb is not None:
+                        wandb.log({f"train/{k}": v for k, v in m.items()}, step=step)
                     if tracking_run is not None:
                         tracking_run.log(
                             {f"train/{k}": v for k, v in m.items()}, step=step
@@ -423,6 +436,10 @@ class Trainer:
                 if d.val_glob and (step % cfg.eval_every == 0 or last):
                     r = self.evaluate(state.params, d.val_glob, d.val_batches)
                     log0(f"[val] step {step} {json.dumps(r['overall'])}")
+                    if wandb is not None:
+                        wandb.log(
+                            {f"val/{k}": v for k, v in r["overall"].items()}, step=step
+                        )
                     if tracking_run is not None:
                         tracking_run.log(
                             {f"val/{k}": v for k, v in r["overall"].items()}, step=step
@@ -430,6 +447,10 @@ class Trainer:
                 if d.test_glob and (step % cfg.test_every == 0 or last):
                     r = self.evaluate(state.params, d.test_glob)
                     log0(f"[test] step {step} {json.dumps(r['overall'])}")
+                    if wandb is not None:
+                        wandb.log(
+                            {f"test/{k}": v for k, v in r["overall"].items()}, step=step
+                        )
                     if tracking_run is not None:
                         tracking_run.log(
                             {f"test/{k}": v for k, v in r["overall"].items()}, step=step
@@ -439,5 +460,7 @@ class Trainer:
             self.ckpt.wait_until_finished()
             return state
         finally:
+            if wandb is not None:
+                wandb.finish()
             if tracking_run is not None:
                 tracking_run.finish()

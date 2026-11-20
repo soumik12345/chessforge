@@ -117,11 +117,8 @@ class ChessforgeUCIEngine:
             np.asarray([epf], np.int32),
             np.asarray([rep_c], np.int32),
         )
-        legal = np.zeros((1, cu.VOCAB_SIZE), dtype=bool)
-        legal[0, cu.legal_move_indices(board).astype(np.int64)] = True
-        return {
+        batch = {
             "board": rel[None],
-            "legal": legal,
             "time_info": np.asarray(
                 [[self.base_time / 100.0, self.inc_time / 100.0, clk_self / 100.0]],
                 np.float32,
@@ -137,6 +134,11 @@ class ChessforgeUCIEngine:
             "oppo_elo": np.asarray([oppo_elo], np.float32),
             "clk_left": np.asarray([clk_self], np.float32),
         }
+        if self.model_cfg.use_joint_move_time:
+            legal = np.zeros((1, cu.VOCAB_SIZE), dtype=bool)
+            legal[0, cu.legal_move_indices(board).astype(np.int64)] = True
+            batch["legal"] = legal
+        return batch
 
     def _idx_to_legal_move(self, idx: int) -> chess.Move | None:
         uci = cu.index_to_uci(int(idx))

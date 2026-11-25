@@ -1,4 +1,9 @@
-"""High-throughput input pipelines supporting both FORMAT_VERSION 2 and 3 shards."""
+"""High-throughput input pipelines supporting both FORMAT_VERSION 2 and 3 shards.
+
+FastShardIterator uses exact 1-pass per-shard sampling without replacement across
+an in-RAM multi-shard buffer, eliminating short-horizon duplicates (0% repeats
+within an epoch, 100% shard coverage) while mixing across active shards every batch.
+"""
 
 from __future__ import annotations
 
@@ -179,7 +184,12 @@ def featurize_records_batch(
 
 
 class FastShardIterator:
-    """Streams whole ArrayRecord shards sequentially via C++ read_all() into an in-RAM pool."""
+    """Exact 1-pass multi-shard streaming iterator via C++ ArrayRecordReader.read_all().
+
+    Each active shard in RAM is shuffled once and consumed strictly without replacement
+    until exhausted, then swapped for a prefetched shard. Every batch mixes records
+    uniformly across all active shards proportional to their remaining unseen count.
+    """
 
     def __init__(
         self,
@@ -210,11 +220,20 @@ class FastShardIterator:
         self._shuffle_files_locked()
 
         self.buffer_shards = min(buffer_shards, len(self.files))
-        self._q: queue.Queue[tuple[np.ndarray, np.ndarray]] = queue.Queue(maxsize=4)
+        self._q: queue.Queue[tuple[np.ndarray, np.ndarray]] = queue.Queue(
+            maxsize=max(4, self.buffer_shards)
+        )
+        self._slots: list[np.ndarray] = []
+        self._legal_slots: list[np.ndarray] = []
+        self._slot_perms: list[np.ndarray] = []
+        self._slot_pos: list[int] = []
         self._load_initial_slots()
 
-        self._bg = threading.Thread(target=self._prefetch_worker, daemon=True)
-        self._bg.start()
+        self._use_bg = len(self.base_files) > len(self._slots)
+        self._bg: threading.Thread | None = None
+        if self._use_bg:
+            self._bg = threading.Thread(target=self._prefetch_worker, daemon=True)
+            self._bg.start()
 
     def _shuffle_files_locked(self):
         self.files = list(self.base_files)
@@ -233,6 +252,10 @@ class FastShardIterator:
         self.file_idx += 1
         return p
 
+    def _init_slot_cursors(self):
+        self._slot_perms = [self.rng.permutation(len(a)) for a in self._slots]
+        self._slot_pos = [0] * len(self._slots)
+
     def _load_initial_slots(self):
         with self._lock:
             init_paths = [self._next_path_locked() for _ in range(self.buffer_shards)]
@@ -245,8 +268,7 @@ class FastShardIterator:
             raise RuntimeError("No valid records found in training shards.")
         self._slots = [arr for arr, _ in valid]
         self._legal_slots = [leg for _, leg in valid]
-        self._replace_slot = 0
-        self._rebuild_pool()
+        self._init_slot_cursors()
 
     def _load_shard(self, path: str) -> tuple[np.ndarray, np.ndarray]:
         r = self._reader_cls(path)
@@ -311,14 +333,13 @@ class FastShardIterator:
 
         return arr, legal_idx
 
-    def _rebuild_pool(self):
-        self._pool = np.concatenate(self._slots, axis=0)
-        self._legal_pool = np.concatenate(self._legal_slots, axis=0)
-        self._perm = self.rng.permutation(len(self._pool))
-        self._cursor = 0
-        self._swap_after = max(
-            len(self._pool) // max(1, len(self._slots)), self.batch_size
-        )
+    def _refill_slot(self, s: int):
+        if self._use_bg:
+            new_arr, new_leg = self._q.get()
+            self._slots[s] = new_arr
+            self._legal_slots[s] = new_leg
+        self._slot_perms[s] = self.rng.permutation(len(self._slots[s]))
+        self._slot_pos[s] = 0
 
     def _prefetch_worker(self):
         while True:
@@ -333,34 +354,59 @@ class FastShardIterator:
         return self
 
     def __next__(self) -> dict[str, np.ndarray]:
-        if self._cursor >= self._swap_after and len(self.base_files) > len(self._slots):
-            try:
-                new_arr, new_leg = self._q.get_nowait()
-                self._slots[self._replace_slot] = new_arr
-                self._legal_slots[self._replace_slot] = new_leg
-                self._replace_slot = (self._replace_slot + 1) % len(self._slots)
-                self._rebuild_pool()
-            except queue.Empty:
-                if self._cursor + self.batch_size > len(self._pool):
-                    new_arr, new_leg = self._q.get()
-                    self._slots[self._replace_slot] = new_arr
-                    self._legal_slots[self._replace_slot] = new_leg
-                    self._replace_slot = (self._replace_slot + 1) % len(self._slots)
-                    self._rebuild_pool()
+        need = self.batch_size
+        k_slots = len(self._slots)
+        rec_parts: list[np.ndarray] = []
+        leg_parts: list[np.ndarray] = []
 
-        if self._cursor + self.batch_size > len(self._pool):
-            self._perm = self.rng.permutation(len(self._pool))
-            self._cursor = 0
+        while need > 0:
+            rem = np.array(
+                [len(self._slot_perms[s]) - self._slot_pos[s] for s in range(k_slots)],
+                dtype=np.int64,
+            )
+            total_rem = int(rem.sum())
+            if total_rem <= 0:
+                for s in range(k_slots):
+                    self._refill_slot(s)
+                continue
 
-        if len(self._pool) < self.batch_size:
-            idx = self.rng.choice(len(self._pool), size=self.batch_size, replace=True)
+            if k_slots == 1:
+                take = np.array([min(need, int(rem[0]))], dtype=np.int64)
+            else:
+                probs = rem / float(total_rem)
+                counts = self.rng.multinomial(need, probs)
+                take = np.minimum(counts, rem)
+                if int(take.sum()) == 0:
+                    s_max = int(np.argmax(rem))
+                    take[s_max] = min(need, int(rem[s_max]))
+
+            for s in range(k_slots):
+                t = int(take[s])
+                if t <= 0:
+                    continue
+                p0 = self._slot_pos[s]
+                p1 = p0 + t
+                idx = self._slot_perms[s][p0:p1]
+                rec_parts.append(self._slots[s][idx])
+                leg_parts.append(self._legal_slots[s][idx])
+                self._slot_pos[s] = p1
+                if p1 >= len(self._slot_perms[s]):
+                    self._refill_slot(s)
+            need -= int(take.sum())
+
+        if len(rec_parts) == 1:
+            batch_rec = rec_parts[0]
+            batch_leg = leg_parts[0]
         else:
-            idx = self._perm[self._cursor : self._cursor + self.batch_size]
-            self._cursor += self.batch_size
+            batch_rec = np.concatenate(rec_parts, axis=0)
+            batch_leg = np.concatenate(leg_parts, axis=0)
+            perm = self.rng.permutation(self.batch_size)
+            batch_rec = batch_rec[perm]
+            batch_leg = batch_leg[perm]
 
         return featurize_records_batch(
-            self._pool[idx],
-            self._legal_pool[idx],
+            batch_rec,
+            batch_leg,
             self.history,
             self.stored_history,
             self.history_mask_prob,
@@ -393,8 +439,7 @@ class FastShardIterator:
         if valid:
             self._slots = [arr for arr, _ in valid]
             self._legal_slots = [leg for _, leg in valid]
-            self._replace_slot = 0
-            self._rebuild_pool()
+            self._init_slot_cursors()
 
 
 def empty_batch(

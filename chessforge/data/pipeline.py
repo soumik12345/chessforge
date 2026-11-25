@@ -11,9 +11,8 @@ import concurrent.futures
 import glob as globlib
 import math
 import os
-import queue
 import shutil
-import threading
+from collections import deque
 
 import grain.python as pygrain
 import jax
@@ -187,8 +186,8 @@ class FastShardIterator:
     """Exact 1-pass multi-shard streaming iterator via C++ ArrayRecordReader.read_all().
 
     Each active shard in RAM is shuffled once and consumed strictly without replacement
-    until exhausted, then swapped for a prefetched shard. Every batch mixes records
-    uniformly across all active shards proportional to their remaining unseen count.
+    until exhausted, then swapped for another shard from the same epoch if available.
+    A batch can span epochs, with the current epoch's remaining records emitted first.
     """
 
     def __init__(
@@ -212,63 +211,70 @@ class FastShardIterator:
         self.seed = seed
         self.dt = records.position_dtype(self.history, records.FORMAT_VERSION)
 
-        self._lock = threading.Lock()
-        self.epoch = 0
-        self.file_idx = 0
         self.rng = np.random.default_rng(seed)
         self.feat_rng = np.random.default_rng(seed + 104729)
-        self._shuffle_files_locked()
+        self.buffer_shards = min(buffer_shards, len(self.base_files))
+        if self.buffer_shards < 1:
+            raise ValueError(
+                "FastShardIterator requires files and at least one buffer slot."
+            )
 
-        self.buffer_shards = min(buffer_shards, len(self.files))
-        self._q: queue.Queue[tuple[np.ndarray, np.ndarray]] = queue.Queue(
-            maxsize=max(4, self.buffer_shards)
-        )
-        self._slots: list[np.ndarray] = []
-        self._legal_slots: list[np.ndarray] = []
-        self._slot_perms: list[np.ndarray] = []
-        self._slot_pos: list[int] = []
-        self._load_initial_slots()
+        self._cache = {}
+        self._pending = deque()
+        self._loader = None
+        if self.buffer_shards < len(self.base_files):
+            self._loader = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._start_epoch(0)
 
-        self._use_bg = len(self.base_files) > len(self._slots)
-        self._bg: threading.Thread | None = None
-        if self._use_bg:
-            self._bg = threading.Thread(target=self._prefetch_worker, daemon=True)
-            self._bg.start()
-
-    def _shuffle_files_locked(self):
+    def _start_epoch(
+        self, epoch: int, *, file_idx=None, slot_indices=None, positions=None
+    ):
+        for future in self._pending:
+            future.cancel()
+        self._pending.clear()
+        self.epoch = epoch
         self.files = list(self.base_files)
-        np.random.default_rng([self.seed, self.epoch]).shuffle(self.files)
+        np.random.default_rng([self.seed, epoch]).shuffle(self.files)
+        if slot_indices is None:
+            slot_indices = list(range(self.buffer_shards))
+        paths = [self.files[i] for i in slot_indices]
+        if self._cache:
+            loaded = [self._cache[path] for path in paths]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.buffer_shards
+            ) as ex:
+                loaded = list(ex.map(self._load_shard, paths))
+            if self._loader is None:
+                self._cache = dict(zip(paths, loaded))
 
-    def _next_path(self) -> str:
-        with self._lock:
-            return self._next_path_locked()
-
-    def _next_path_locked(self) -> str:
-        if self.file_idx >= len(self.files):
-            self.epoch += 1
-            self.file_idx = 0
-            self._shuffle_files_locked()
-        p = self.files[self.file_idx]
-        self.file_idx += 1
-        return p
-
-    def _init_slot_cursors(self):
-        self._slot_perms = [self.rng.permutation(len(a)) for a in self._slots]
-        self._slot_pos = [0] * len(self._slots)
-
-    def _load_initial_slots(self):
-        with self._lock:
-            init_paths = [self._next_path_locked() for _ in range(self.buffer_shards)]
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, self.buffer_shards)
-        ) as ex:
-            loaded = list(ex.map(self._load_shard, init_paths))
-        valid = [(arr, leg) for arr, leg in loaded if arr.size > 0]
-        if not valid:
+        self.file_idx = self.buffer_shards if file_idx is None else file_idx
+        self._slot_indices = list(slot_indices)
+        self._slots = [arr for arr, _ in loaded]
+        self._legal_slots = [leg for _, leg in loaded]
+        self._slot_perms = [
+            self._permutation(i, len(arr)) for i, (arr, _) in zip(slot_indices, loaded)
+        ]
+        self._slot_pos = list(positions) if positions is not None else [0] * len(loaded)
+        self._prefetch()
+        for slot, arr in enumerate(self._slots):
+            if not len(arr):
+                self._refill_slot(slot)
+        if not any(len(arr) for arr in self._slots):
             raise RuntimeError("No valid records found in training shards.")
-        self._slots = [arr for arr, _ in valid]
-        self._legal_slots = [leg for _, leg in valid]
-        self._init_slot_cursors()
+
+    def _permutation(self, file_idx: int, size: int):
+        # A separate stream per shard makes partially consumed orders reproducible.
+        seed = np.random.SeedSequence(self.seed, spawn_key=(self.epoch, file_idx))
+        return np.random.default_rng(seed).permutation(size)
+
+    def _prefetch(self):
+        if self._loader is None:
+            return
+        first = self.file_idx + len(self._pending)
+        stop = min(len(self.files), self.file_idx + self.buffer_shards)
+        for i in range(first, stop):
+            self._pending.append(self._loader.submit(self._load_shard, self.files[i]))
 
     def _load_shard(self, path: str) -> tuple[np.ndarray, np.ndarray]:
         r = self._reader_cls(path)
@@ -334,21 +340,19 @@ class FastShardIterator:
         return arr, legal_idx
 
     def _refill_slot(self, s: int):
-        if self._use_bg:
-            new_arr, new_leg = self._q.get()
-            self._slots[s] = new_arr
-            self._legal_slots[s] = new_leg
-        self._slot_perms[s] = self.rng.permutation(len(self._slots[s]))
-        self._slot_pos[s] = 0
-
-    def _prefetch_worker(self):
-        while True:
-            try:
-                arr, leg = self._load_shard(self._next_path())
-                if arr.size > 0:
-                    self._q.put((arr, leg))
-            except Exception:  # noqa: BLE001
-                continue
+        """Leave the slot exhausted when no more shards remain in this epoch."""
+        while self._pending:
+            arr, leg = self._pending[0].result()
+            self._pending.popleft()
+            i = self.file_idx
+            self.file_idx += 1
+            self._prefetch()
+            if len(arr):
+                self._slots[s], self._legal_slots[s] = arr, leg
+                self._slot_indices[s] = i
+                self._slot_perms[s] = self._permutation(i, len(arr))
+                self._slot_pos[s] = 0
+                return
 
     def __iter__(self):
         return self
@@ -359,6 +363,7 @@ class FastShardIterator:
         rec_parts: list[np.ndarray] = []
         leg_parts: list[np.ndarray] = []
 
+        epoch_starts = [0]
         while need > 0:
             rem = np.array(
                 [len(self._slot_perms[s]) - self._slot_pos[s] for s in range(k_slots)],
@@ -366,8 +371,10 @@ class FastShardIterator:
             )
             total_rem = int(rem.sum())
             if total_rem <= 0:
-                for s in range(k_slots):
-                    self._refill_slot(s)
+                self._start_epoch(self.epoch + 1)
+                drawn = self.batch_size - need
+                if drawn:
+                    epoch_starts.append(drawn)
                 continue
 
             if k_slots == 1:
@@ -400,7 +407,10 @@ class FastShardIterator:
         else:
             batch_rec = np.concatenate(rec_parts, axis=0)
             batch_leg = np.concatenate(leg_parts, axis=0)
-            perm = self.rng.permutation(self.batch_size)
+            # Preserve epoch boundaries in the returned record order.
+            perm = np.arange(self.batch_size)
+            for start, stop in zip(epoch_starts, epoch_starts[1:] + [self.batch_size]):
+                self.rng.shuffle(perm[start:stop])
             batch_rec = batch_rec[perm]
             batch_leg = batch_leg[perm]
 
@@ -414,32 +424,41 @@ class FastShardIterator:
         )
 
     def get_state(self) -> dict:
-        with self._lock:
-            return {"epoch": self.epoch, "file_idx": self.file_idx}
+        return {
+            "epoch": self.epoch,
+            "file_idx": self.file_idx,
+            "slot_indices": self._slot_indices.copy(),
+            "positions": self._slot_pos.copy(),
+            "rng": self.rng.bit_generator.state,
+            "feat_rng": self.feat_rng.bit_generator.state,
+        }
 
     def set_state(self, state: dict):
-        with self._lock:
-            self.epoch = int(state.get("epoch", 0))
-            saved_idx = int(state.get("file_idx", 0))
-            self.file_idx = max(0, saved_idx - self.buffer_shards)
-            self._shuffle_files_locked()
-            reload_paths = [self._next_path_locked() for _ in range(self.buffer_shards)]
-
-        while True:
-            try:
-                self._q.get_nowait()
-            except queue.Empty:
-                break
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, self.buffer_shards)
-        ) as ex:
-            loaded = list(ex.map(self._load_shard, reload_paths))
-        valid = [(arr, leg) for arr, leg in loaded if arr.size > 0]
-        if valid:
-            self._slots = [arr for arr, _ in valid]
-            self._legal_slots = [leg for _, leg in valid]
-            self._init_slot_cursors()
+        epoch = int(state.get("epoch", 0))
+        if "slot_indices" in state:
+            if len(state["slot_indices"]) != self.buffer_shards:
+                raise ValueError(
+                    "Restoring active shard cursors requires the same buffer size."
+                )
+            self._start_epoch(
+                epoch,
+                file_idx=state["file_idx"],
+                slot_indices=state["slot_indices"],
+                positions=state["positions"],
+            )
+            self.rng.bit_generator.state = state["rng"]
+            self.feat_rng.bit_generator.state = state["feat_rng"]
+        else:
+            # Legacy checkpoints only tracked the producer's file cursor.
+            start = max(
+                0,
+                min(int(state.get("file_idx", 0)), len(self.files))
+                - self.buffer_shards,
+            )
+            stop = start + self.buffer_shards
+            self._start_epoch(
+                epoch, file_idx=stop, slot_indices=list(range(start, stop))
+            )
 
 
 def empty_batch(

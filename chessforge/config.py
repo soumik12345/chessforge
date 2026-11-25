@@ -35,7 +35,7 @@ class ModelConfig:
     param_dtype: str = "float32"
 
     # ChessformerV2 extensions (ignored by v1 Chessformer)
-    num_registers: int = 4  # [CLS_VALUE, CLS_PONDER, REG_PLAN_1, REG_PLAN_2]
+    num_registers: int = 4  # post-trunk CrossAttentionPool when > 0
     use_swiglu: bool = True
     use_qk_norm: bool = True
     use_adaln: bool = True
@@ -102,14 +102,17 @@ class TrainConfig:
     model_overrides: dict = field(default_factory=dict)
     data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
+    policy_coef: float = 1.0  # SFT move CE weight (can be lowered during KL-anchored DPO)
     value_coef: float = 0.1
     ponder_coef: float = 0.0
     reply_coef: float = 0.0  # 2-ply human opponent reply auxiliary loss
     label_smoothing: float = 0.0
     dpo_coef: float = 0.0  # Anti-Engine DPO / contrastive loss weight
     dpo_beta: float = 0.2
+    kl_coef: float = 0.0  # KL(pi_ref || pi_theta) anchor against init_from_checkpoint
+    freeze_value_head: bool = False  # keep SFT value head frozen during Stage-3 DPO
     sf_max_cp_loss: float = 35.0  # only prefer human over SF when human move loses <= N cp
-    init_from_checkpoint: str = ""  # initialize weights (and DPO ref_params) from checkpoint dir
+    init_from_checkpoint: str = ""  # initialize weights (and ref_params) from checkpoint dir
     init_from_step: int | None = None
     mask_illegal_in_loss: bool = True
     seed: int = 42

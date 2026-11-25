@@ -93,6 +93,7 @@ def maia3_loss(
     *,
     aux: dict | None = None,
     ref_logits_move: jax.Array | None = None,
+    policy_coef: float = 1.0,
     value_coef: float = 0.1,
     ponder_coef: float = 0.0,
     joint_time_coef: float = 0.0,
@@ -100,6 +101,7 @@ def maia3_loss(
     label_smoothing: float = 0.0,
     dpo_coef: float = 0.0,
     dpo_beta: float = 0.2,
+    kl_coef: float = 0.0,
     sf_max_cp_loss: float = 35.0,
     mask_illegal: bool = True,
 ):
@@ -127,6 +129,7 @@ def maia3_loss(
             else logits_move_f32
         )
         logp = jax.nn.log_softmax(logits, axis=-1)
+
     nll_move = -jnp.take_along_axis(logp, batch["move"][:, None], axis=1)[:, 0]
     if label_smoothing > 0.0 and "legal" in batch:
         leg_f = batch["legal"].astype(jnp.float32)
@@ -141,15 +144,15 @@ def maia3_loss(
     )
     loss_p = (pol * w).sum() / wsum
     loss_v = (val * w).sum() / wsum
-    total = loss_p + value_coef * loss_v
+    total = policy_coef * loss_p + value_coef * loss_v
     metrics = {"policy_loss": loss_p, "value_loss": loss_v}
 
     if joint:
         joint_nll, posterior_nll, time_weight = joint_time_nll_sums(
             aux["ponder_logits"], conditional_logp, batch, w
         )
-        # At coefficient 1, the unsmoothed policy and posterior losses sum to
-        # joint NLL on clocked rows and marginal move NLL on the others.
+        # At policy_coef=1 and joint_time_coef=1, unsmoothed policy + posterior
+        # losses sum to exact joint NLL on clocked rows and marginal move NLL otherwise.
         loss_joint_time = posterior_nll / wsum
         total = total + joint_time_coef * loss_joint_time
         metrics["joint_time_loss"] = loss_joint_time
@@ -194,6 +197,26 @@ def maia3_loss(
         total = total + reply_coef * loss_r
         metrics["reply_loss"] = loss_r
 
+    ref_logp = None
+    if ref_logits_move is not None and (dpo_coef > 0 or kl_coef > 0):
+        ref_l = ref_logits_move.astype(jnp.float32)
+        if legal is not None:
+            ref_mask = legal | ~jnp.any(legal, axis=-1, keepdims=True)
+            ref_l = jnp.where(ref_mask, ref_l, -1e9)
+        ref_logp = jax.nn.log_softmax(ref_l, axis=-1)
+
+    if kl_coef > 0 and ref_logp is not None:
+        if legal is not None:
+            ref_mask = legal | ~jnp.any(legal, axis=-1, keepdims=True)
+            ref_p = jnp.where(ref_mask, jnp.exp(ref_logp), 0.0)
+        else:
+            ref_p = jnp.exp(ref_logp)
+        safe_diff = jnp.where(ref_p > 0.0, ref_logp - logp, 0.0)
+        kl_elem = jnp.sum(ref_p * safe_diff, axis=-1)
+        loss_kl = (kl_elem * w).sum() / wsum
+        total = total + kl_coef * loss_kl
+        metrics["kl_loss"] = loss_kl
+
     if dpo_coef > 0 and "sf_move" in batch:
         sf_m = batch["sf_move"]
         sf_cp = batch.get("sf_cp_loss", jnp.zeros_like(w))
@@ -208,11 +231,7 @@ def maia3_loss(
         lp_sf = jnp.take_along_axis(logp, jnp.maximum(sf_m, 0)[:, None], axis=1)[:, 0]
         margin = lp_hum - lp_sf
 
-        if ref_logits_move is not None:
-            ref_l = ref_logits_move.astype(jnp.float32)
-            if mask_illegal and "legal" in batch:
-                ref_l = jnp.where(batch["legal"], ref_l, -1e9)
-            ref_logp = jax.nn.log_softmax(ref_l, axis=-1)
+        if ref_logp is not None:
             rlp_hum = jnp.take_along_axis(ref_logp, batch["move"][:, None], axis=1)[:, 0]
             rlp_sf = jnp.take_along_axis(
                 ref_logp, jnp.maximum(sf_m, 0)[:, None], axis=1
@@ -228,8 +247,6 @@ def maia3_loss(
 
     metrics["loss"] = total
     if joint:
-        # Preserve the meaning of the unmasked metric: the supplied model
-        # output may already have been normalized over legal moves per bucket.
         logits_move_f32, _ = joint_move_log_probs(
             aux["ponder_logits"], aux["conditional_move_logits"]
         )

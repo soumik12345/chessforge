@@ -5,7 +5,31 @@ from __future__ import annotations
 import os
 
 
+def _is_tpu_host() -> bool:
+    if os.environ.get("JAX_PLATFORMS", "").lower() == "tpu":
+        return True
+    if any(
+        k in os.environ
+        for k in (
+            "TPU_NAME",
+            "TPU_WORKER_ID",
+            "TPU_CHIPS_PER_HOST_BOUNDS",
+            "CLOUD_TPU_TASK_ID",
+            "COLAB_TPU_ADDR",
+        )
+    ):
+        return True
+    return os.path.exists("/dev/accel0") or (
+        os.path.exists("/dev/vfio") and not os.path.exists("/dev/nvidia0")
+    )
+
+
 def configure_xla_env() -> None:
+    # Only set CUDA Triton GEMM flags on NVIDIA GPU hosts; newer libtpu rejects GPU flags.
+    if _is_tpu_host() or not (
+        os.path.exists("/dev/nvidia0") or os.environ.get("CUDA_VISIBLE_DEVICES")
+    ):
+        return
     flags = os.environ.get("XLA_FLAGS", "")
     extra = []
     if "--xla_gpu_triton_gemm_any" not in flags:
@@ -43,7 +67,7 @@ def init_distributed() -> None:
         jax.distributed.initialize()
         return
 
-    # 3) Multi-host Cloud TPU pod (Colab v5e-1 / v6e-1 is single-host and skips cleanly)
+    # 3) Multi-host Cloud TPU pod (single-host v5e-1 / v6e-1 skips cleanly)
     tpu_chips_per_host = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "")
     has_multihost_tpu = any(
         k in os.environ
@@ -53,7 +77,6 @@ def init_distributed() -> None:
         jax.distributed.initialize()
         return
 
-    # Fallback probe for environments managed by JAX coordinator env vars
     if "JAX_COORDINATOR_ADDRESS" in os.environ or (
         tpu_chips_per_host and os.environ.get("CLOUD_TPU_TASK_ID") not in (None, "0")
     ):

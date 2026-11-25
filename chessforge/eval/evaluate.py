@@ -1,4 +1,4 @@
-"""Move-matching accuracy, top-3, entropy, per-rating breakdown, and Anti-Engine (Eval-AntiSF)."""
+"""Move-matching accuracy, top-3, entropy, cognitive-effort MI, per-rating, and Anti-Engine eval."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from flax import nnx
 
 from chessforge.models import ChessformerV2, forward_model
 from chessforge.models.joint_time import joint_move_log_probs
-from chessforge.train.losses import joint_time_nll_sums
+from chessforge.train.losses import hl_gauss_ponder_targets, joint_time_nll_sums
 
 NUM_RATING_BINS = 32  # round(game_elo / 100), clipped
 
@@ -21,8 +21,9 @@ def make_eval_step(
 ):
     def step(params: nnx.State, batch: dict):
         model = nnx.merge(graphdef, params)
-        joint = isinstance(model, ChessformerV2) and model.cfg.use_joint_move_time
-        outputs = forward_model(model, batch, deterministic=True, return_aux=joint)
+        is_v2 = isinstance(model, ChessformerV2)
+        joint = is_v2 and model.cfg.use_joint_move_time
+        outputs = forward_model(model, batch, deterministic=True, return_aux=is_v2)
         lm, lv, _ = outputs[:3]
         lm = lm.astype(jnp.float32)
         lv = lv.astype(jnp.float32)
@@ -45,25 +46,52 @@ def make_eval_step(
             jnp.any(top3 == batch["move"][:, None], axis=-1).astype(jnp.float32) * w
         )
         unmasked = lm
+        effort_metrics = {}
         joint_metrics = {}
-        if joint:
+
+        if is_v2:
             aux = outputs[3]
-            # The joint forward pass returns a legally normalized mixture.
-            # Recover the truly unmasked mixture for the existing diagnostic.
-            unmasked, _ = joint_move_log_probs(
-                aux["ponder_logits"], aux["conditional_move_logits"]
+            ponder_logits = aux["ponder_logits"].astype(jnp.float32)
+            p_sec = batch.get("ponder", jnp.full_like(w, jnp.nan)).astype(jnp.float32)
+            c_left = batch.get("clk_left", jnp.zeros_like(w)).astype(jnp.float32)
+            h_clk = batch.get("has_clock", jnp.zeros_like(w)).astype(jnp.float32)
+            targets, time_w = hl_gauss_ponder_targets(
+                ponder_logits.shape[-1], p_sec, c_left, h_clk, w
             )
-            _, conditional_logp = joint_move_log_probs(
-                aux["ponder_logits"], aux["conditional_move_logits"], legal
-            )
-            joint_nll, posterior_nll, time_weight = joint_time_nll_sums(
-                aux["ponder_logits"], conditional_logp, batch, w
-            )
-            joint_metrics = {
-                "joint_time_weight": time_weight,
-                "joint_nll": joint_nll,
-                "effort_given_move_nll": posterior_nll,
+            eff_logp = jax.nn.log_softmax(ponder_logits, axis=-1)
+            marg_eff_nll = (-(targets * eff_logp).sum(axis=-1) * time_w).sum()
+
+            clean_p = jnp.where(time_w > 0, p_sec, 0.0)
+            clean_c = jnp.where(time_w > 0, jnp.maximum(c_left, 1.0), 1.0)
+            u_obs = jnp.clip(jnp.log1p(clean_p) / jnp.log1p(clean_c), 0.0, 1.0)
+            u_pred = aux["ponder_effort"].astype(jnp.float32)
+            effort_metrics = {
+                "effort_weight": time_w.sum(),
+                "marginal_effort_nll": marg_eff_nll,
+                "effort_abs_err": (jnp.abs(u_pred - u_obs) * time_w).sum(),
+                "effort_obs_sum": (u_obs * time_w).sum(),
+                "effort_pred_sum": (u_pred * time_w).sum(),
+                "effort_obs_sq_sum": (u_obs * u_obs * time_w).sum(),
+                "effort_pred_sq_sum": (u_pred * u_pred * time_w).sum(),
+                "effort_cross_sum": (u_obs * u_pred * time_w).sum(),
             }
+
+            if joint:
+                unmasked, _ = joint_move_log_probs(
+                    aux["ponder_logits"], aux["conditional_move_logits"]
+                )
+                _, conditional_logp = joint_move_log_probs(
+                    aux["ponder_logits"], aux["conditional_move_logits"], legal
+                )
+                joint_nll, posterior_nll, j_time_weight = joint_time_nll_sums(
+                    aux["ponder_logits"], conditional_logp, batch, w
+                )
+                joint_metrics = {
+                    "joint_time_weight": j_time_weight,
+                    "joint_nll": joint_nll,
+                    "effort_given_move_nll": posterior_nll,
+                }
+
         correct_unmasked = (jnp.argmax(unmasked, -1) == batch["move"]).astype(
             jnp.float32
         ) * w
@@ -76,7 +104,6 @@ def make_eval_step(
         )
         vacc = (jnp.argmax(lv, -1) == batch["value"]).astype(jnp.float32) * w
 
-        # Anti-Engine disagreement slice (where human move != Stockfish #1 and loses <= sf_max_cp_loss)
         sf_m = batch.get("sf_move", jnp.full_like(batch["move"], -1))
         sf_cp = batch.get("sf_cp_loss", jnp.full_like(w, -1.0))
         disagree = (
@@ -116,6 +143,7 @@ def make_eval_step(
             "bin_n": oh.sum(0),
             "bin_correct": (oh * correct[:, None]).sum(0),
             "bin_nll": (oh * nll[:, None]).sum(0),
+            **effort_metrics,
             **joint_metrics,
         }
 
@@ -145,6 +173,18 @@ def summarize(s: dict) -> dict:
             float(s["anti_sf_human_pref_prob"]) / anti_n
         )
 
+    eff_w = float(s.get("effort_weight", 0.0))
+    if eff_w > 0:
+        overall["marginal_effort_nll"] = float(s["marginal_effort_nll"]) / eff_w
+        overall["ponder_effort_mae"] = float(s["effort_abs_err"]) / eff_w
+        mx = float(s["effort_obs_sum"]) / eff_w
+        my = float(s["effort_pred_sum"]) / eff_w
+        vx = max(float(s["effort_obs_sq_sum"]) / eff_w - mx * mx, 0.0)
+        vy = max(float(s["effort_pred_sq_sum"]) / eff_w - my * my, 0.0)
+        cov = float(s["effort_cross_sum"]) / eff_w - mx * my
+        denom = math.sqrt(vx * vy)
+        overall["ponder_effort_r"] = cov / denom if denom > 1e-12 else 0.0
+
     time_weight = float(s.get("joint_time_weight", 0.0))
     if "joint_time_weight" in s:
         overall["joint_time_weight"] = time_weight
@@ -153,6 +193,10 @@ def summarize(s: dict) -> dict:
         overall["effort_given_move_nll"] = (
             float(s["effort_given_move_nll"]) / time_weight
         )
+        if eff_w > 0:
+            overall["effort_move_mi_nats"] = (
+                overall["marginal_effort_nll"] - overall["effort_given_move_nll"]
+            )
 
     per_bin = {}
     for b in range(NUM_RATING_BINS):

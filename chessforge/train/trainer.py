@@ -25,6 +25,18 @@ from chessforge.models import (
 from chessforge.train.losses import maia3_loss
 from chessforge.train.schedule import build_lr_schedule
 
+_VALUE_HEAD_KEYS = frozenset({"fc_value", "fc_value_hid", "value_norm"})
+
+
+def _mask_value_head(tree):
+    def _zero_val(path, leaf):
+        keys = [str(getattr(k, "key", getattr(k, "name", k))) for k in path]
+        if any(k in _VALUE_HEAD_KEYS for k in keys):
+            return jnp.zeros_like(leaf)
+        return leaf
+
+    return jax.tree_util.tree_map_with_path(_zero_val, tree)
+
 
 @struct.dataclass
 class TrainState:
@@ -113,7 +125,9 @@ class Trainer:
         cfg, graphdef = self.cfg, self.graphdef
         accum = cfg.optim.grad_accum_steps
         deterministic = self.model_cfg.dropout == 0.0
-        use_dpo_ref = cfg.dpo_coef > 0 and bool(cfg.init_from_checkpoint)
+        use_ref = (cfg.dpo_coef > 0 or cfg.kl_coef > 0) and bool(
+            cfg.init_from_checkpoint
+        )
 
         def loss_fn(params, ref_params, batch, rng):
             model = nnx.merge(graphdef, params)
@@ -145,6 +159,7 @@ class Trainer:
                 batch,
                 aux=aux,
                 ref_logits_move=ref_lm,
+                policy_coef=cfg.policy_coef,
                 value_coef=cfg.value_coef,
                 ponder_coef=cfg.ponder_coef,
                 joint_time_coef=cfg.joint_time_coef,
@@ -152,6 +167,7 @@ class Trainer:
                 label_smoothing=cfg.label_smoothing,
                 dpo_coef=cfg.dpo_coef,
                 dpo_beta=cfg.dpo_beta,
+                kl_coef=cfg.kl_coef,
                 sf_max_cp_loss=cfg.sf_max_cp_loss,
                 mask_illegal=cfg.mask_illegal_in_loss,
             )
@@ -197,14 +213,16 @@ class Trainer:
                 grads = jax.tree.map(lambda g: g / accum, grads)
                 metrics = jax.tree.map(lambda m: m / accum, metrics)
             if "joint_nll_sum" in metrics:
-                # Counts and numerators must sum across microbatches, including
-                # those with no clock labels; averaging their means is biased.
                 metrics["joint_time_weight"] *= accum
                 metrics["joint_nll_sum"] *= accum
                 metrics["joint_nll"] = metrics["joint_nll_sum"] / jnp.maximum(
                     metrics["joint_time_weight"], 1e-8
                 )
+            if cfg.freeze_value_head:
+                grads = _mask_value_head(grads)
             updates, opt_state = self.tx.update(grads, state.opt_state, state.params)
+            if cfg.freeze_value_head:
+                updates = _mask_value_head(updates)
             params = optax.apply_updates(state.params, updates)
             metrics = dict(
                 metrics,
@@ -215,7 +233,7 @@ class Trainer:
                 step=state.step + 1, params=params, opt_state=opt_state
             ), metrics
 
-        ref_in_sharding = self.repl if use_dpo_ref else None
+        ref_in_sharding = self.repl if use_ref else None
         self.p_train_step = jax.jit(
             train_step,
             in_shardings=(self.repl, ref_in_sharding, self.data_sharding, self.repl),
@@ -290,7 +308,7 @@ class Trainer:
             ext_params = self._load_external_params(
                 self.cfg.init_from_checkpoint, self.cfg.init_from_step
             )
-            if self.cfg.dpo_coef > 0:
+            if self.cfg.dpo_coef > 0 or self.cfg.kl_coef > 0:
                 self.ref_params = jax.device_put(
                     jax.tree.map(lambda x: x.astype(jnp.bfloat16), ext_params), self.repl
                 )
@@ -319,7 +337,11 @@ class Trainer:
         return restored.params
 
     def evaluate(
-        self, params: nnx.State, pattern: str, max_batches: int | None = None
+        self,
+        params: nnx.State,
+        pattern: str,
+        max_batches: int | None = None,
+        batch_transform=None,
     ) -> dict:
         d = self.cfg.data
         batches = pipeline.eval_batches(
@@ -330,6 +352,8 @@ class Trainer:
             max_batches,
             d.read_threads,
         )
+        if batch_transform is not None:
+            batches = (batch_transform(b) for b in batches)
         return run_eval(self.eval_step, params, (self.to_global(b) for b in batches))
 
     def fit(self):

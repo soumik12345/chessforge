@@ -4,8 +4,8 @@ from pathlib import Path
 
 import chess
 import jax
-import jax.numpy as jnp
 import numpy as np
+import pytest
 from flax import nnx
 
 from chessforge import chess_utils as cu
@@ -15,40 +15,52 @@ from chessforge.eval.evaluate import summarize
 from chessforge.train.trainer import Trainer
 
 
-def test_fast_shard_iterator_exact_one_pass_zero_duplicates(tmp_path: Path):
-    # Write 12 shards x 25 records = 300 uniquely tagged positions (ply = 0..299)
-    n_shards, per_shard = 12, 25
-    for s in range(n_shards):
-        w = pgn.ShardedWriter(str(tmp_path), f"sh{s:02d}", records_per_shard=per_shard)
-        for i in range(per_shard):
-            uid = s * per_shard + i
-            w.write(
+@pytest.mark.parametrize("buffer_shards", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 7, 32])
+def test_fast_shard_iterator_exact_one_pass_zero_duplicates(
+    tmp_path: Path, buffer_shards, batch_size
+):
+    uid = 0
+    for shard, size in enumerate([1, 4, 2, 3]):
+        writer = pgn.ShardedWriter(str(tmp_path), f"sh{shard}", records_per_shard=size)
+        for _ in range(size):
+            writer.write(
                 records.encode_position(
                     boards=np.zeros((2, 64), np.int8),
                     n_hist=1,
                     stm=0,
-                    move=uid % 4096,
-                    self_elo=2000 + uid,  # unique marker
+                    move=uid,
+                    self_elo=2000,
                     oppo_elo=2000,
                     value=1,
                     ply=uid,
-                    legal=[uid % 4096],
+                    legal=[uid],
                 )
             )
-        w.close()
+            uid += 1
+        writer.close()
 
     files = sorted(str(p) for p in tmp_path.glob("*.array_record"))
-    assert len(files) == n_shards
     it = pipeline.FastShardIterator(
-        files=files, batch_size=20, history=2, history_mask_prob=0.0, seed=7, buffer_shards=4
+        files=files,
+        batch_size=batch_size,
+        history=2,
+        seed=0,
+        buffer_shards=buffer_shards,
     )
-    # Draw 10 batches = 200 records (< 300 total): must have 0 duplicates!
     seen = []
-    for _ in range(10):
-        b = next(it)
-        seen.extend(int(x) - 2000 for x in b["self_elo"])
-    assert len(seen) == 200
-    assert len(set(seen)) == 200, f"Found {200 - len(set(seen))} short-horizon duplicates!"
+    while len(seen) < 3 * uid:
+        moves = next(it)["move"].tolist()
+        assert len(moves) == batch_size
+        seen.extend(moves)
+    for start in range(0, 3 * uid, uid):
+        assert sorted(seen[start : start + uid]) == list(range(uid))
+
+    state = it.get_state()
+    expected = [next(it)["move"] for _ in range(3)]
+    it.set_state(state)
+    for batch in expected:
+        np.testing.assert_array_equal(next(it)["move"], batch)
 
 
 def test_kl_anchored_dpo_freeze_value_head_and_mi_eval(tmp_path: Path):
